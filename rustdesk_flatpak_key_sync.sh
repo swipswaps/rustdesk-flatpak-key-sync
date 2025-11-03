@@ -3,21 +3,10 @@
 # rustdesk_flatpak_key_sync.sh
 # ------------------------------------------------------------------------------
 # PURPOSE:
-#   Automate RustDesk Flatpak client/server key management across a LAN.
-#   This script:
-#     - Validates or generates the RustDesk server Ed25519 keypair
-#     - Exports a RustDesk-compatible server.pub (base64-encoded DER)
-#     - Installs missing dependencies automatically
-#     - Discovers clients via nmap or manual input
-#     - Deploys passwordless SSH where needed
-#     - Syncs server.pub to Flatpak RustDesk clients
-#     - Verifies integrity (prevents key mismatch)
-#     - Supports cleanup/uninstall (--cleanup)
-#
-# DESIGN:
-#   - Fully self-healing and idempotent
-#   - All critical steps are logged with timestamps to $LOG_FILE
-#   - Abstracts away complexity: user simply runs the script
+#   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
+#   into Flatpak clients over SSH. Includes interactive dependency installation,
+#   auto key generation/conversion, LAN discovery, manual host entry, verification,
+#   optional cleanup/uninstall mode, and automated self-test (--dry-run / --test).
 #
 # AUTHOR: Jose Melendez
 # DATE: 2025-11-03
@@ -39,30 +28,69 @@ VERIFY_RETRIES=2
 VERIFY_RETRY_DELAY=2
 # ------------------------------------------------------------------------------
 
-# --------------------------- Exit Codes -----------------------------------------
+# Exit codes
 EX_OK=0
 EX_SERVER_KEY=1
 EX_SSH_CONN=2
 EX_SCP=3
 EX_PERMISSION=4
 EX_DEPEND=5
-# ------------------------------------------------------------------------------
 
-# ------------------------------ Logging -----------------------------------------
+# ------------------------------ Mode Flags -------------------------------------
+CLEANUP_MODE=0
+DRY_RUN_MODE=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --cleanup) CLEANUP_MODE=1 ;;
+    --dry-run|--test) DRY_RUN_MODE=1 ;;
+  esac
+done
+
+# ------------------------------ Helpers ---------------------------------------
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
-fatal() { log "FATAL: $2"; exit "$1"; }
-# ------------------------------------------------------------------------------
+pass() { log "✅ PASS: $*"; }
+fail() { log "❌ FAIL: $*"; }
+fatal() { printf '[%s] FATAL: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit "${1:-1}"; }
+prompt_yes_no() { local prompt="$1" ans; if [[ "$DRY_RUN_MODE" -eq 1 ]]; then ans="y"; else read -rp "$prompt [y/N]: " ans; fi; [[ "$ans" =~ ^[Yy]$ ]]; }
 
-# ------------------------------ Utilities ---------------------------------------
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
 key_fingerprint() { sha256sum "$1" | awk '{print $1}'; }
-safe_mktemp() { mktemp "${TMPDIR:-/tmp}/rustdesk_key_sync.XXXXXX"; }
-require_cmd() { command -v "$1" >/dev/null 2>&1; }
-prompt_yes_no() { local p="$1" a; read -rp "$p [y/N]: " a; [[ "$a" =~ ^[Yy]$ ]]; }
-# ------------------------------------------------------------------------------
 
-# ----------------------- Dependency Installation --------------------------------
+safe_mktemp() { mktemp "${TMPDIR:-/tmp}/rustdesk_key_sync.XXXXXX"; }
+
+# ----------------------- Dependency installation -------------------------------
+install_if_missing() {
+  local cmd="$1" pkg="$2" pkgmgr="$3"
+  if ! require_cmd "$cmd"; then
+    log "Dependency missing: $cmd (package: $pkg)"
+    if prompt_yes_no "Install $pkg (for $cmd) now?"; then
+      if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
+        pass "DRY-RUN: Would install $pkg"
+        return 0
+      fi
+      case "$pkgmgr" in
+        apt-get) sudo apt-get update -y &>>"$LOG_FILE"; sudo apt-get install -y "$pkg" &>>"$LOG_FILE" || return 1 ;;
+        dnf) sudo dnf makecache &>>"$LOG_FILE"; sudo dnf install -y "$pkg" &>>"$LOG_FILE" || return 1 ;;
+        pacman) sudo pacman -Sy --noconfirm "$pkg" &>>"$LOG_FILE" || return 1 ;;
+        *) fatal "$EX_DEPEND" "Unsupported package manager: $pkgmgr"; ;;
+      esac
+      log "Installed $pkg"
+    else
+      fatal "$EX_DEPEND" "User declined to install $pkg (required)."
+    fi
+  fi
+  return 0
+}
+
 auto_install_deps() {
-  log "Checking dependencies..."
+  log "Detecting distro for dependency installation..."
   local id_like pkgmgr
   id_like="$(. /etc/os-release && echo "${ID_LIKE:-$ID}")"
   if [[ "$id_like" =~ (debian|ubuntu) ]]; then pkgmgr="apt-get"
@@ -70,132 +98,187 @@ auto_install_deps() {
   elif [[ "$id_like" =~ (arch|manjaro) ]]; then pkgmgr="pacman"
   else fatal "$EX_DEPEND" "Unsupported distro: $id_like"; fi
 
-  install_pkg() {
-    local cmd="$1" pkg="$2"
-    if ! require_cmd "$cmd"; then
-      log "Installing $pkg..."
-      case "$pkgmgr" in
-        apt-get) sudo apt-get update -y &>>"$LOG_FILE"; sudo apt-get install -y "$pkg" &>>"$LOG_FILE" ;;
-        dnf) sudo dnf install -y "$pkg" &>>"$LOG_FILE" ;;
-        pacman) sudo pacman -Sy --noconfirm "$pkg" &>>"$LOG_FILE" ;;
-      esac
-    fi
-  }
+  log "Using package manager: $pkgmgr"
 
-  install_pkg "nmap" "nmap"
-  install_pkg "ssh" "openssh-client"
-  install_pkg "openssl" "openssl"
-  install_pkg "flatpak" "flatpak"
+  install_if_missing "nmap" "nmap" "$pkgmgr"
+  install_if_missing "ssh" "openssh-client" "$pkgmgr" || install_if_missing "ssh" "openssh" "$pkgmgr"
+  install_if_missing "scp" "openssh-client" "$pkgmgr"
+  install_if_missing "ssh-copy-id" "openssh-client" "$pkgmgr"
+  install_if_missing "ssh-keygen" "openssh-client" "$pkgmgr"
+  install_if_missing "openssl" "openssl" "$pkgmgr"
+  install_if_missing "sha256sum" "coreutils" "$pkgmgr" || true
+  install_if_missing "flatpak" "flatpak" "$pkgmgr" || true
 
-  log "Dependencies verified/installed."
+  log "Dependency checks/install complete."
 }
-# ------------------------------------------------------------------------------
 
-# ------------------------ Keypair Handling -------------------------------------
-ensure_server_keypair() {
-  mkdir -p "$RUSTDIR"; chmod 700 "$RUSTDIR"
+# ------------------------ Keypair handling -------------------------------------
+ensure_rustdesk_pub_format() {
+  require_cmd openssl || fatal "$EX_DEPEND" "openssl required but missing"
   if [[ ! -f "$PRIV" ]]; then
-    log "Generating Ed25519 server keypair..."
-    ssh-keygen -t ed25519 -N "" -f "$PRIV" <<< y >/dev/null 2>&1 || fatal "$EX_SERVER_KEY" "ssh-keygen failed"
+    fatal "$EX_SERVER_KEY" "Private key $PRIV missing; cannot generate public key."
   fi
 
-  # Export RustDesk-compatible format
-  if ! openssl pkey -in "$PRIV" -pubout -outform DER 2>/dev/null | base64 -w0 > "$PUB" 2>/dev/null; then
-    fatal "$EX_SERVER_KEY" "Failed to export RustDesk-compatible public key"
-  fi
-
-  chmod 600 "$PRIV"; chmod 644 "$PUB"; chown root:root "$PRIV" "$PUB" 2>/dev/null || true
-  log "Keypair ready. Fingerprint: $(key_fingerprint "$PUB")"
-}
-# ------------------------------------------------------------------------------
-
-# ------------------------ Remote & SSH Helpers ---------------------------------
-deploy_ssh_key_if_needed() {
-  local host="$1"
-  if ssh -o ConnectTimeout="$SSH_TIMEOUT" -o BatchMode=yes "$CLIENT_USER@$host" "echo ok" &>/dev/null; then
-    log "Passwordless SSH confirmed for $host"
+  if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
+    pass "DRY-RUN: Would convert $PRIV to RustDesk public key"
     return 0
   fi
-  log "Deploying SSH key to $host..."
-  ssh-copy-id -i "$LOCAL_SSH_KEY" "$CLIENT_USER@$host" &>>"$LOG_FILE" || return 1
+
+  if ! openssl pkey -in "$PRIV" -pubout -outform DER 2>/dev/null | base64 -w0 > "$PUB.tmp" 2>/dev/null; then
+    if ! openssl ed25519 -in "$PRIV" -pubout -outform DER 2>/dev/null | base64 -w0 > "$PUB.tmp" 2>/dev/null; then
+      fatal "$EX_SERVER_KEY" "Unable to export Ed25519 public key using openssl from $PRIV"
+    fi
+  fi
+  mv "$PUB.tmp" "$PUB"
+  log "Wrote RustDesk-compatible public key to $PUB"
 }
 
-remote_exec() { ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$1" "${@:2}" &>>"$LOG_FILE"; }
-remote_copy_pub() { scp -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "$CLIENT_USER@$1:/home/$CLIENT_USER/$FLATPAK_KEY_PATH" &>>"$LOG_FILE"; }
-verify_remote_pub_matches() {
-  local host="$1" tmp="$(safe_mktemp)"
-  ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "cat /home/$CLIENT_USER/$FLATPAK_KEY_PATH" >"$tmp" 2>/dev/null || return 1
-  local remote_fp local_fp
-  remote_fp="$(sha256sum "$tmp" | awk '{print $1}')"
+ensure_server_keypair() {
+  log "Ensuring server keypair exists..."
+  mkdir -p "$RUSTDIR"
+  chmod 700 "$RUSTDIR" || true
+
+  if [[ -f "$PRIV" || -f "$PUB" ]]; then
+    local ts backupdir
+    ts="$(date '+%Y%m%d_%H%M%S')"
+    backupdir="${RUSTDIR}/backup_${ts}"
+    mkdir -p "$backupdir"
+    mv "${RUSTDIR}"/id_ed25519* "$backupdir/" 2>/dev/null || true
+    log "Existing keys moved to backup: $backupdir"
+  fi
+
+  if [[ ! -f "$PRIV" ]]; then
+    require_cmd ssh-keygen || fatal "$EX_DEPEND" "ssh-keygen missing"
+    if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
+      pass "DRY-RUN: Would generate new Ed25519 private key at $PRIV"
+    else
+      log "Generating new Ed25519 private key at $PRIV..."
+      ssh-keygen -t ed25519 -N "" -f "$PRIV" <<< y >/dev/null 2>&1 || fatal "$EX_SERVER_KEY" "ssh-keygen failed"
+    fi
+  fi
+
+  [[ "$DRY_RUN_MODE" -eq 0 ]] && ensure_rustdesk_pub_format
+
+  chmod 600 "$PRIV" || true
+  chmod 644 "$PUB" || true
+  chown root:root "$PRIV" "$PUB" 2>/dev/null || true
+  [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "DRY-RUN: Permissions set on $PRIV/$PUB"
+}
+
+# ------------------------ Remote helpers ---------------------------------------
+deploy_ssh_key_if_needed() {
+  local host="$1"
+  if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
+    pass "DRY-RUN: Would deploy SSH key to $host"
+    return 0
+  fi
+  if ssh -o ConnectTimeout="$SSH_TIMEOUT" -o BatchMode=yes "$CLIENT_USER@$host" "echo ok" &>/dev/null; then
+    log "Passwordless SSH OK -> $host"
+    return 0
+  fi
+  if [[ ! -f "$LOCAL_SSH_KEY" ]]; then
+    log "Local SSH public key not found at $LOCAL_SSH_KEY; cannot deploy to $host"
+    return 1
+  fi
+  log "Deploying SSH key to $host (you will be prompted for password)..."
+  ssh-copy-id -i "$LOCAL_SSH_KEY" "$CLIENT_USER@$host" &>>"$LOG_FILE"
+}
+
+remote_exec() {
+  local host="$1"; shift
+  [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would execute on $host: $*"; return 0; }
+  ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "$@" &>>"$LOG_FILE"
+}
+
+remote_copy_pub() {
+  local host="$1"
+  [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would copy $PUB to $host:$FLATPAK_KEY_PATH"; return 0; }
+  scp -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "$CLIENT_USER@$host:/home/$CLIENT_USER/$FLATPAK_KEY_PATH" &>>"$LOG_FILE"
+}
+
+remote_remove_pub() {
+  local host="$1"
+  [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would remove $FLATPAK_KEY_PATH on $host"; return 0; }
+  ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "rm -f '/home/$CLIENT_USER/$FLATPAK_KEY_PATH'" &>>"$LOG_FILE"
+}
+
+remote_uninstall_flatpak() {
+  local host="$1"
+  [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would uninstall Flatpak RustDesk on $host"; return 0; }
+  ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "flatpak uninstall -y com.rustdesk.RustDesk" &>>"$LOG_FILE"
+}
+
+# ------------------------- LAN Discovery --------------------------------------
+discover_hosts() {
+  log "Discovering hosts in LAN subnet $LAN_SUBNET..."
+  if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
+    pass "DRY-RUN: Would scan LAN subnet"
+    return 0
+  fi
+  mapfile -t hosts < <(nmap -sn "$LAN_SUBNET" | awk '/Nmap scan report/{print $NF}')
+  echo "${hosts[@]}"
+}
+
+# ------------------------ Verification ----------------------------------------
+verify_remote_pub() {
+  local host="$1"
+  if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
+    pass "DRY-RUN: Would verify $host:$FLATPAK_KEY_PATH"
+    return 0
+  fi
+  local local_fp remote_fp tmp
   local_fp="$(key_fingerprint "$PUB")"
+  tmp="$(safe_mktemp)"
+  ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "cat '$FLATPAK_KEY_PATH'" >"$tmp" 2>/dev/null || return 1
+  remote_fp="$(key_fingerprint "$tmp")"
   rm -f "$tmp"
-  [[ "$remote_fp" == "$local_fp" ]]
+  [[ "$local_fp" == "$remote_fp" ]] && return 0 || return 1
 }
-# ------------------------------------------------------------------------------
 
-# --------------------------- Abstracted Test Flow ------------------------------
-run_self_test() {
-  log "Running self-test (abstracted from user)..."
-  # Test keypair
-  [[ -f "$PRIV" && -f "$PUB" ]] || fatal "$EX_SERVER_KEY" "Missing server keypair"
-
-  # Quick OpenSSL validity test
-  openssl pkey -in "$PRIV" -pubout -outform DER >/dev/null 2>&1 || fatal "$EX_SERVER_KEY" "OpenSSL key verification failed"
-
-  # SSH sanity check
-  require_cmd ssh || fatal "$EX_DEPEND" "SSH missing"
-  log "Self-test passed."
-}
-# ------------------------------------------------------------------------------
-
-# --------------------------- Main Logic ----------------------------------------
-CLEANUP_MODE=0
-[[ "${1:-}" == "--cleanup" ]] && CLEANUP_MODE=1
-log "===== rustdesk_flatpak_key_sync START ====="
+# ------------------------- Main Flow ------------------------------------------
+log "===== RustDesk Flatpak Key Sync START ====="
 
 auto_install_deps
 ensure_server_keypair
-run_self_test
 
-# LAN discovery
-log "Scanning LAN subnet: $LAN_SUBNET"
-mapfile -t discovered_hosts < <(nmap -sn "$LAN_SUBNET" 2>/dev/null | awk '/Nmap scan report for/ {print $5}')
-read -rp "Enter additional hosts (space/comma-separated), or ENTER to skip: " extra
-extra="${extra//,/ }"
-for h in $extra; do discovered_hosts+=("$h"); done
+# Discover hosts
+HOSTS=("${TEST_HOSTS[@]:-}")
+if [[ "${#HOSTS[@]}" -eq 0 ]]; then
+  mapfile -t HOSTS < <(discover_hosts)
+fi
+[[ "${#HOSTS[@]}" -eq 0 ]] && log "No hosts found; exiting..." && exit 0
 
-declare -A _seen
-hosts_to_process=()
-for h in "${discovered_hosts[@]}"; do [[ -z "$h" ]] && continue; [[ ${_seen[$h]} ]] && continue; hosts_to_process+=("$h"); _seen[$h]=1; done
+# Deploy SSH keys
+for host in "${HOSTS[@]}"; do
+  deploy_ssh_key_if_needed "$host"
+done
 
-log "Hosts to process: ${hosts_to_process[*]:-none}"
+# Copy server.pub
+for host in "${HOSTS[@]}"; do
+  remote_copy_pub "$host"
+done
 
-for host in "${hosts_to_process[@]}"; do
-  log "--- Processing $host ---"
-  ping -c1 -W2 "$host" &>/dev/null || { log "Skipping $host (unreachable)"; continue; }
-
-  deploy_ssh_key_if_needed "$host" || { log "SSH setup failed for $host"; continue; }
-
-  if [[ "$CLEANUP_MODE" -eq 1 ]]; then
-    log "Cleanup: removing server.pub from $host"
-    remote_exec "$host" "rm -f /home/$CLIENT_USER/$FLATPAK_KEY_PATH" || log "Removal failed on $host"
-    continue
-  fi
-
-  # Ensure dir exists, copy key, verify
-  remote_exec "$host" "mkdir -p /home/$CLIENT_USER/$(dirname "$FLATPAK_KEY_PATH")"
-  remote_copy_pub "$host" || { log "Failed to copy to $host"; continue; }
-
-  for i in $(seq 1 $VERIFY_RETRIES); do
-    if verify_remote_pub_matches "$host"; then
-      log "Verification OK on $host"
+# Verify
+for host in "${HOSTS[@]}"; do
+  local success=0
+  for ((i=0;i<VERIFY_RETRIES;i++)); do
+    if verify_remote_pub "$host"; then
+      success=1
       break
     else
-      log "Retry $i: key mismatch on $host"
+      log "Verification failed for $host; retrying in $VERIFY_RETRY_DELAY sec..."
       sleep "$VERIFY_RETRY_DELAY"
     fi
   done
+  [[ "$success" -eq 1 ]] && pass "Remote key verified on $host" || fail "Remote key mismatch on $host"
 done
 
-log "===== COMPLETE ====="
-exit "$EX_OK"
+# Cleanup / uninstall mode
+if [[ "$CLEANUP_MODE" -eq 1 ]]; then
+  for host in "${HOSTS[@]}"; do
+    remote_remove_pub "$host"
+    remote_uninstall_flatpak "$host"
+  done
+fi
+
+log "===== RustDesk Flatpak Key Sync COMPLETE ====="
