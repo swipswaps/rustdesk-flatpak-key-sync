@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-03.4)
+# rustdesk_flatpak_key_sync.sh (v2025-11-03.5)
 # ------------------------------------------------------------------------------
 # PURPOSE:
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH.
 #
-#   Upgraded to reliably export RustDesk public key (DER->base64) on all distros.
+#   Upgraded to reliably export RustDesk public key using ssh-keygen DER/base64.
 # ==============================================================================
 
 set -euo pipefail
@@ -24,8 +24,8 @@ LOCAL_SSH_KEY="${HOME}/.ssh/id_ed25519.pub"
 SSH_TIMEOUT=6
 VERIFY_RETRIES=2
 VERIFY_RETRY_DELAY=2
-EXPORT_RETRIES=3     # Increased retries for robustness
-EXPORT_TMP_SUFFIX=".pub.tmp"
+EXPORT_RETRIES=3
+EXPORT_TMP_SUFFIX=".tmp"
 
 # Mode flags
 CLEANUP_MODE=0
@@ -122,31 +122,21 @@ export_rustdesk_pub_with_retries() {
     log "Export attempt #$tries: converting $PRIV -> RustDesk pub (tmp: $tmpfile)"
     [[ ! -f "$PRIV" ]] && fatal "Private key $PRIV missing; cannot export."
 
-    # Modern OpenSSL route
-    if openssl pkey -in "$PRIV" -pubout -outform DER 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then
+    # Reliable ssh-keygen method
+    if ssh-keygen -e -f "$PRIV" -m PKCS8 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then
       :
     else
-      # Fallback: raw Ed25519 (compat with older OpenSSL)
-      if openssl genpkey -algorithm Ed25519 -pkeyopt privkey:"$PRIV" -pubout -outform DER 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then
-        :
-      else
-        warn "OpenSSL export command failed on attempt #$tries"
-        rm -f "$tmpfile" 2>/dev/null || true
-        sleep 1
-        continue
-      fi
-    fi
-
-    # Validate tmpfile
-    if [[ -s "$tmpfile" ]]; then
-      mv -f "$tmpfile" "$PUB"
-      pass "Export succeeded (attempt #$tries) -> $PUB"
-      return 0
-    else
-      warn "Export produced empty tmp file on attempt #$tries; retrying..."
+      warn "ssh-keygen export failed on attempt #$tries"
       rm -f "$tmpfile" 2>/dev/null || true
       sleep 1
+      continue
     fi
+
+    [[ -s "$tmpfile" ]] && { mv -f "$tmpfile" "$PUB"; pass "Export succeeded (attempt #$tries) -> $PUB"; return 0; }
+
+    warn "Export produced empty tmp file on attempt #$tries; retrying..."
+    rm -f "$tmpfile" 2>/dev/null
+    sleep 1
   done
 
   fatal "Failed to export RustDesk public key after $EXPORT_RETRIES attempts"
