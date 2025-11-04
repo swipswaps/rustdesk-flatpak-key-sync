@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-03.5)
+# rustdesk_flatpak_key_sync.sh (v2025-11-03.6)
 # ------------------------------------------------------------------------------
 # PURPOSE:
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH.
 #
-#   Upgraded to reliably export RustDesk public key using ssh-keygen DER/base64.
+#   Fixed export method: uses ssh-keygen -y from private key to public key.
 # ==============================================================================
 
 set -euo pipefail
@@ -119,11 +119,11 @@ export_rustdesk_pub_with_retries() {
   rm -f "$tmpfile" 2>/dev/null || true
 
   while (( ++tries <= EXPORT_RETRIES )); do
-    log "Export attempt #$tries: converting $PRIV -> RustDesk pub (tmp: $tmpfile)"
+    log "Export attempt #$tries: generating RustDesk pub from $PRIV -> tmp: $tmpfile"
     [[ ! -f "$PRIV" ]] && fatal "Private key $PRIV missing; cannot export."
 
-    # Reliable ssh-keygen method
-    if ssh-keygen -e -f "$PRIV" -m PKCS8 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then
+    # Correct method: ssh-keygen -y (private -> public), base64 single-line
+    if ssh-keygen -y -f "$PRIV" 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then
       :
     else
       warn "ssh-keygen export failed on attempt #$tries"
