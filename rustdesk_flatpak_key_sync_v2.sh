@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync_v2.sh (v2025-11-04.1)
+# rustdesk_flatpak_key_sync_v3.sh (v2025-11-04.2)
 # ------------------------------------------------------------------------------
 # PURPOSE:
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH, including LAN auto-discovery via mDNS.
-#   Fixes:
-#     - Avahi/mDNS startup issues
-#     - RustDesk Flatpak libcuda/FFI startup warnings
-#     - Suppressed network spam logs (DPT=1900/5353)
+#   Upgrades from v2:
+#     - Strips parentheses from host discovery
+#     - Correctly resolves local SSH key under sudo
+#     - Improved host reachability verification and logging
 # ==============================================================================
 
 set -euo pipefail
@@ -21,13 +21,20 @@ FLATPAK_KEY_PATH=".var/app/com.rustdesk.RustDesk/config/rustdesk/server.pub"
 CLIENT_USER="owner"
 LAN_SUBNET="192.168.1.0/24"
 LOG_FILE="/var/log/rustdesk_flatpak_key_sync.log"
-LOCAL_SSH_KEY="${HOME}/.ssh/id_ed25519.pub"
-[[ ! -f "$LOCAL_SSH_KEY" ]] && LOCAL_SSH_KEY="${HOME}/.ssh/id_rsa.pub"
 SSH_TIMEOUT=6
 VERIFY_RETRIES=3
 VERIFY_RETRY_DELAY=2
 EXPORT_RETRIES=3
 EXPORT_TMP_SUFFIX=".tmp"
+
+# Detect SSH key properly, even if running sudo
+if [[ -n "${SUDO_USER:-}" ]]; then
+  LOCAL_USER="$SUDO_USER"
+else
+  LOCAL_USER="$USER"
+fi
+LOCAL_SSH_KEY="/home/$LOCAL_USER/.ssh/id_ed25519.pub"
+[[ ! -f "$LOCAL_SSH_KEY" ]] && LOCAL_SSH_KEY="/home/$LOCAL_USER/.ssh/id_rsa.pub"
 
 # Mode flags
 CLEANUP_MODE=0
@@ -39,23 +46,19 @@ GREEN="\e[32m"
 YELLOW="\e[33m"
 RESET="\e[0m"
 
-# ------------------------------ Basic setup ------------------------------------
-_log_dir="$(dirname "$LOG_FILE")"
-mkdir -p "$_log_dir" 2>/dev/null || true
-touch "$LOG_FILE" 2>/dev/null || true
-chmod 644 "$LOG_FILE" 2>/dev/null || true
-
-# ------------------------------ Helpers ---------------------------------------
+# ------------------------------ Logging ---------------------------------------
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
 pass() { printf "%b✅ %s%b\n" "$GREEN" "$*" "$RESET"; log "PASS: $*"; }
 fail() { printf "%b❌ %s%b\n" "$RED" "$*" "$RESET"; log "FAIL: $*"; }
 warn() { printf "%b⚠️ %s%b\n" "$YELLOW" "$*" "$RESET"; log "WARN: $*"; }
 fatal(){ printf '[%s] FATAL: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
+
 prompt_yes_no() {
   local prompt="$1" ans
   if [[ "$DRY_RUN_MODE" -eq 1 ]]; then ans="y"; else read -rp "$prompt [y/N]: " ans; fi
   [[ "$ans" =~ ^[Yy]$ ]]
 }
+
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
 key_fingerprint() { sha256sum "$1" | awk '{print $1}'; }
 safe_mktemp() { mktemp "${TMPDIR:-/tmp}/rustdesk_key_sync.XXXXXX"; }
@@ -67,7 +70,7 @@ for arg in "$@"; do
     --dry-run|--test) DRY_RUN_MODE=1 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: rustdesk_flatpak_key_sync_v2.sh [--dry-run] [--cleanup]
+Usage: rustdesk_flatpak_key_sync_v3.sh [--dry-run] [--cleanup]
 --dry-run / --test  : simulate actions (auto-answer prompts)
 --cleanup           : remove server.pub from clients and optionally uninstall Flatpak
 USAGE
@@ -124,7 +127,6 @@ ensure_avahi() {
   if ! systemctl is-active --quiet avahi-daemon; then
     fatal "Avahi daemon failed to start; check journalctl -xe"
   fi
-  # Open firewall for mDNS/SSDP if firewalld is present
   if require_cmd firewall-cmd; then
     sudo firewall-cmd --permanent --add-service=mdns || true
     sudo firewall-cmd --permanent --add-service=ssdp || true
@@ -161,7 +163,6 @@ ensure_server_keypair() {
   mkdir -p "$RUSTDIR"
   chmod 700 "$RUSTDIR" 2>/dev/null || true
 
-  # Backup old keys
   if [[ -f "$PRIV" || -f "$PUB" ]]; then
     local ts backupdir
     ts="$(date '+%Y%m%d_%H%M%S')"
@@ -171,7 +172,6 @@ ensure_server_keypair() {
     log "Existing keys moved to backup: $backupdir"
   fi
 
-  # Generate private if missing
   if [[ ! -f "$PRIV" ]]; then
     require_cmd ssh-keygen || fatal "ssh-keygen missing"
     if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
@@ -192,7 +192,7 @@ ensure_server_keypair() {
 discover_hosts() {
   [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would scan LAN $LAN_SUBNET"; printf '%s\n' "192.168.1.101" "192.168.1.102"; return; }
   require_cmd nmap || { warn "nmap missing"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
-  mapfile -t found < <(nmap -sn "$LAN_SUBNET" 2>/dev/null | awk '/Nmap scan report for/ {print $NF}')
+  mapfile -t found < <(nmap -sn "$LAN_SUBNET" 2>/dev/null | awk '/Nmap scan report for/ {gsub(/[()]/,"",$NF); print $NF}')
   [[ "${#found[@]}" -eq 0 ]] && { warn "No hosts discovered"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
   for h in "${found[@]}"; do printf '%s\n' "$h"; done
 }
