@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-04.3)
+# rustdesk_flatpak_key_sync.sh (v2025-11-04.4)
 # ------------------------------------------------------------------------------
 # PURPOSE:
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH.
 #
-#   Upgraded: Auto-detect original user SSH keys under sudo
-#            Cleaned host logging
-#            Full recursion guard retained
+#   Upgraded: 
+#     - Auto-detect original user SSH keys under sudo
+#     - Cleaned host logging
+#     - Full recursion guard retained
+#     - Completed --cleanup mode
+#     - Host summary & verification
 # ==============================================================================
 
 set -euo pipefail
@@ -195,9 +198,9 @@ remote_copy_pub() {
   warn "SCP ultimately failed for $host after $SCP_RETRIES attempts"
 }
 
-verify_remote_pub() {
+remote_verify_pub() {
   local host="$1"
-  [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would verify remote key"; return 0; }
+  [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would verify remote key on $host"; return 0; }
   local tmp remote_fp local_fp
   tmp="$(safe_mktemp)"
   ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "cat '$FLATPAK_KEY_PATH'" >"$tmp" 2>/dev/null || return 1
@@ -205,6 +208,12 @@ verify_remote_pub() {
   local_fp="$(key_fingerprint "$PUB")"
   rm -f "$tmp" 2>/dev/null
   [[ "$remote_fp" == "$local_fp" ]]
+}
+
+remote_remove_pub() {
+  local host="$1"
+  [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would remove $FLATPAK_KEY_PATH from $host"; return; }
+  ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "rm -f ~/$FLATPAK_KEY_PATH" &>>"$LOG_FILE" && pass "Removed $FLATPAK_KEY_PATH on $host" || warn "Failed to remove key on $host"
 }
 
 remote_restart_flatpak() {
@@ -226,10 +235,27 @@ mapfile -t HOSTS < <(discover_hosts)
 [[ "${#HOSTS[@]}" -eq 0 ]] && { warn "No hosts discovered/supplied"; exit 0; }
 pass "Hosts to process: ${HOSTS[*]}"
 
+declare -A HOST_STATUS
+
 for host in "${HOSTS[@]}"; do
   log "---- Host: $host ----"
-  [[ "$DRY_RUN_MODE" -eq 0 ]] && ! ping -c1 -W2 "$host" &>/dev/null && { warn "$host unreachable"; continue; }
-  deploy_ssh_key_if_needed "$host" || { warn "Skipping $host due to SSH issues"; continue; }
+  [[ "$DRY_RUN_MODE" -eq 0 ]] && ! ping -c1 -W2 "$host" &>/dev/null && { warn "$host unreachable"; HOST_STATUS["$host"]="unreachable"; continue; }
+  deploy_ssh_key_if_needed "$host" || { warn "Skipping $host due to SSH issues"; HOST_STATUS["$host"]="ssh-fail"; continue; }
 
   if [[ "$CLEANUP_MODE" -eq 1 ]]; then
-    prompt_yes_no "Remove server.pub on $host?" && {
+    prompt_yes_no "Remove server.pub on $host?" && { remote_remove_pub "$host"; HOST_STATUS["$host"]="removed"; continue; }
+  else
+    remote_copy_pub "$host"
+    for i in $(seq 1 $VERIFY_RETRIES); do
+      if remote_verify_pub "$host"; then pass "Remote key verified on $host"; HOST_STATUS["$host"]="ok"; break; fi
+      warn "Verification failed on $host (attempt $i/$VERIFY_RETRIES)"
+      sleep $VERIFY_RETRY_DELAY
+    done
+    remote_restart_flatpak "$host"
+  fi
+done
+
+log "===== RustDesk Flatpak Key Sync COMPLETE ====="
+for h in "${!HOST_STATUS[@]}"; do
+  log "Host $h: ${HOST_STATUS[$h]}"
+done
