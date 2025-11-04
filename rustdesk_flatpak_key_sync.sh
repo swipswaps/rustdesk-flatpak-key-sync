@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-04.2)
+# rustdesk_flatpak_key_sync.sh (v2025-11-04.3)
 # ------------------------------------------------------------------------------
 # PURPOSE:
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH.
 #
-#   Upgraded: Full recursion guard
-#   Added: SCP retries, verbose filtered host logging
+#   Upgraded: Fixed sudo/home key detection, stripped host parens, cleaned logs
+#   Added: SCP retries, verbose filtered host logging, recursion-safe discovery
 # ==============================================================================
 
 set -euo pipefail
@@ -20,8 +20,6 @@ FLATPAK_KEY_PATH=".var/app/com.rustdesk.RustDesk/config/rustdesk/server.pub"
 CLIENT_USER="owner"
 LAN_SUBNET="192.168.1.0/24"
 LOG_FILE="/var/log/rustdesk_flatpak_key_sync.log"
-LOCAL_SSH_KEY="${HOME}/.ssh/id_ed25519.pub"
-[[ ! -f "$LOCAL_SSH_KEY" ]] && LOCAL_SSH_KEY="${HOME}/.ssh/id_rsa.pub"
 SSH_TIMEOUT=6
 VERIFY_RETRIES=2
 VERIFY_RETRY_DELAY=2
@@ -58,6 +56,22 @@ prompt_yes_no() {
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
 key_fingerprint() { sha256sum "$1" | awk '{print $1}'; }
 safe_mktemp() { mktemp "${TMPDIR:-/tmp}/rustdesk_key_sync.XXXXXX"; }
+
+# Determine proper local SSH key under sudo or normal
+detect_local_ssh_key() {
+  local candidate
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    candidate="${HOME}/.ssh/id_ed25519.pub"
+    [[ ! -f "$candidate" ]] && candidate="/home/${SUDO_USER}/.ssh/id_ed25519.pub"
+    [[ ! -f "$candidate" ]] && candidate="/home/${SUDO_USER}/.ssh/id_rsa.pub"
+  else
+    candidate="$HOME/.ssh/id_ed25519.pub"
+    [[ ! -f "$candidate" ]] && candidate="$HOME/.ssh/id_rsa.pub"
+  fi
+  [[ ! -f "$candidate" ]] && warn "No local SSH key found at $candidate"
+  echo "$candidate"
+}
+LOCAL_SSH_KEY="$(detect_local_ssh_key)"
 
 # ------------------------------ Argument Parsing -------------------------------
 for arg in "$@"; do
@@ -176,12 +190,14 @@ discover_hosts() {
   require_cmd nmap || { warn "nmap missing"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
 
   mapfile -t found < <(nmap -sn "$LAN_SUBNET" 2>/dev/null | awk '/Nmap scan report for/ {print $NF}')
+
   [[ "${#found[@]}" -eq 0 ]] && { warn "No hosts discovered"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
 
   # Self-IP detection
   local self_ips=($(hostname -I | tr ' ' '\n' | grep -v '^127\.'))
   local filtered=()
   for h in "${found[@]}"; do
+    h="${h//[\(\)]/}"  # Strip parentheses
     local skip=0
     for s in "${self_ips[@]}"; do [[ "$h" == "$s" ]] && { skip=1; break; } done
     [[ "$skip" -eq 0 || "$SELF_ALLOW_MODE" -eq 1 ]] && filtered+=("$h") || log "Skipping local host IP $h to prevent recursion"
@@ -237,35 +253,4 @@ log "===== RustDesk Flatpak Key Sync START ====="
 [[ "$CLEANUP_MODE" -eq 1 ]] && pass "MODE: CLEANUP"
 [[ "$SELF_ALLOW_MODE" -eq 1 ]] && pass "MODE: SELF-ALLOW enabled (local host will be included)"
 
-auto_install_deps
-ensure_server_keypair
-
-mapfile -t HOSTS < <(discover_hosts)
-[[ "${#HOSTS[@]}" -eq 0 ]] && { warn "No hosts discovered/supplied"; exit 0; }
-pass "Hosts to process: ${HOSTS[*]}"
-
-for host in "${HOSTS[@]}"; do
-  log "---- Host: $host ----"
-  [[ "$DRY_RUN_MODE" -eq 0 ]] && ! ping -c1 -W2 "$host" &>/dev/null && { warn "$host unreachable"; continue; }
-  deploy_ssh_key_if_needed "$host" || { warn "Skipping $host due to SSH issues"; continue; }
-
-  if [[ "$CLEANUP_MODE" -eq 1 ]]; then
-    prompt_yes_no "Remove server.pub on $host?" && { [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "DRY-RUN: Would remove server.pub" || ssh "$CLIENT_USER@$host" "rm -f '/home/$CLIENT_USER/$FLATPAK_KEY_PATH'" &>>"$LOG_FILE"; pass "Removed server.pub on $host"; }
-    prompt_yes_no "Also uninstall Flatpak RustDesk on $host?" && { [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "DRY-RUN: Would uninstall Flatpak" || ssh "$CLIENT_USER@$host" "flatpak uninstall -y com.rustdesk.RustDesk" &>>"$LOG_FILE"; pass "Flatpak uninstalled on $host"; }
-    continue
-  fi
-
-  remote_copy_pub "$host"
-  [[ "$DRY_RUN_MODE" -eq 0 ]] && ssh "$CLIENT_USER@$host" "chmod 644 '/home/$CLIENT_USER/$FLATPAK_KEY_PATH'; chown $CLIENT_USER:$CLIENT_USER '/home/$CLIENT_USER/$FLATPAK_KEY_PATH'" &>>"$LOG_FILE" || warn "Perms/chown might have failed"
-  remote_restart_flatpak "$host"
-
-  local verified=0
-  for _ in $(seq 1 "$VERIFY_RETRIES"); do
-    if verify_remote_pub "$host"; then verified=1; pass "VERIFICATION OK on $host"; break; fi
-    warn "Verification failed; retrying in $VERIFY_RETRY_DELAY s"; sleep "$VERIFY_RETRY_DELAY"
-  done
-  [[ "$verified" -ne 1 ]] && fail "VERIFICATION FAILED on $host"
-done
-
-log "===== RustDesk Flatpak Key Sync COMPLETE ====="
-exit 0
+auto
