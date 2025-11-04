@@ -6,8 +6,9 @@
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH.
 #
-#   Upgraded: Fixed sudo/home key detection, stripped host parens, cleaned logs
-#   Added: SCP retries, verbose filtered host logging, recursion-safe discovery
+#   Upgraded: Auto-detect original user SSH keys under sudo
+#            Cleaned host logging
+#            Full recursion guard retained
 # ==============================================================================
 
 set -euo pipefail
@@ -27,16 +28,23 @@ EXPORT_RETRIES=3
 EXPORT_TMP_SUFFIX=".tmp"
 SCP_RETRIES=3
 
+# Detect proper user SSH key even if running via sudo
+if [[ -n "${SUDO_USER:-}" ]]; then
+    LOCAL_SSH_KEY="${HOME}/.ssh/id_ed25519.pub"
+    [[ ! -f "$LOCAL_SSH_KEY" ]] && LOCAL_SSH_KEY="/home/${SUDO_USER}/.ssh/id_ed25519.pub"
+    [[ ! -f "$LOCAL_SSH_KEY" ]] && LOCAL_SSH_KEY="/home/${SUDO_USER}/.ssh/id_rsa.pub"
+else
+    LOCAL_SSH_KEY="${HOME}/.ssh/id_ed25519.pub"
+    [[ ! -f "$LOCAL_SSH_KEY" ]] && LOCAL_SSH_KEY="${HOME}/.ssh/id_rsa.pub"
+fi
+
 # Mode flags
 CLEANUP_MODE=0
 DRY_RUN_MODE=0
 SELF_ALLOW_MODE=0
 
 # ------------------------------ Colors for UX ----------------------------------
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-RESET="\e[0m"
+RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; RESET="\e[0m"
 
 # ------------------------------ Basic setup ------------------------------------
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -48,30 +56,10 @@ pass() { printf "%b✅ %s%b\n" "$GREEN" "$*" "$RESET"; log "PASS: $*"; }
 fail() { printf "%b❌ %s%b\n" "$RED" "$*" "$RESET"; log "FAIL: $*"; }
 warn() { printf "%b⚠️ %s%b\n" "$YELLOW" "$*" "$RESET"; log "WARN: $*"; }
 fatal(){ printf '[%s] FATAL: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
-prompt_yes_no() {
-  local prompt="$1" ans
-  if [[ "$DRY_RUN_MODE" -eq 1 ]]; then ans="y"; else read -rp "$prompt [y/N]: " ans; fi
-  [[ "$ans" =~ ^[Yy]$ ]]
-}
+prompt_yes_no() { local prompt="$1" ans; [[ "$DRY_RUN_MODE" -eq 1 ]] && ans="y" || read -rp "$prompt [y/N]: " ans; [[ "$ans" =~ ^[Yy]$ ]]; }
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
 key_fingerprint() { sha256sum "$1" | awk '{print $1}'; }
 safe_mktemp() { mktemp "${TMPDIR:-/tmp}/rustdesk_key_sync.XXXXXX"; }
-
-# Determine proper local SSH key under sudo or normal
-detect_local_ssh_key() {
-  local candidate
-  if [[ -n "${SUDO_USER:-}" ]]; then
-    candidate="${HOME}/.ssh/id_ed25519.pub"
-    [[ ! -f "$candidate" ]] && candidate="/home/${SUDO_USER}/.ssh/id_ed25519.pub"
-    [[ ! -f "$candidate" ]] && candidate="/home/${SUDO_USER}/.ssh/id_rsa.pub"
-  else
-    candidate="$HOME/.ssh/id_ed25519.pub"
-    [[ ! -f "$candidate" ]] && candidate="$HOME/.ssh/id_rsa.pub"
-  fi
-  [[ ! -f "$candidate" ]] && warn "No local SSH key found at $candidate"
-  echo "$candidate"
-}
-LOCAL_SSH_KEY="$(detect_local_ssh_key)"
 
 # ------------------------------ Argument Parsing -------------------------------
 for arg in "$@"; do
@@ -134,35 +122,19 @@ auto_install_deps() {
 export_rustdesk_pub_with_retries() {
   local tries=0 tmpfile="${PUB}${EXPORT_TMP_SUFFIX}"
   rm -f "$tmpfile" 2>/dev/null || true
-
   while (( ++tries <= EXPORT_RETRIES )); do
     log "Export attempt #$tries: generating RustDesk pub from $PRIV -> tmp: $tmpfile"
     [[ ! -f "$PRIV" ]] && fatal "Private key $PRIV missing; cannot export."
-
-    if ssh-keygen -y -f "$PRIV" 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then
-      :
-    else
-      warn "ssh-keygen export failed on attempt #$tries"
-      rm -f "$tmpfile" 2>/dev/null || true
-      sleep 1
-      continue
-    fi
-
+    if ssh-keygen -y -f "$PRIV" 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then :; else warn "ssh-keygen export failed on attempt #$tries"; rm -f "$tmpfile"; sleep 1; continue; fi
     [[ -s "$tmpfile" ]] && { mv -f "$tmpfile" "$PUB"; pass "Export succeeded (attempt #$tries) -> $PUB"; return 0; }
-
-    warn "Export produced empty tmp file on attempt #$tries; retrying..."
-    rm -f "$tmpfile" 2>/dev/null
-    sleep 1
+    warn "Export produced empty tmp file on attempt #$tries; retrying..."; rm -f "$tmpfile"; sleep 1
   done
-
   fatal "Failed to export RustDesk public key after $EXPORT_RETRIES attempts"
 }
 
 ensure_server_keypair() {
   log "Ensuring server keypair exists..."
-  mkdir -p "$RUSTDIR"
-  chmod 700 "$RUSTDIR" 2>/dev/null || true
-
+  mkdir -p "$RUSTDIR"; chmod 700 "$RUSTDIR" 2>/dev/null || true
   if [[ -f "$PRIV" || -f "$PUB" ]]; then
     local ts backupdir
     ts="$(date '+%Y%m%d_%H%M%S')"
@@ -171,12 +143,10 @@ ensure_server_keypair() {
     mv "${RUSTDIR}"/id_ed25519* "$backupdir/" 2>/dev/null || true
     log "Existing keys moved to backup: $backupdir"
   fi
-
   if [[ ! -f "$PRIV" ]]; then
     require_cmd ssh-keygen || fatal "ssh-keygen missing"
     [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "DRY-RUN: Would generate Ed25519 private key at $PRIV" || ssh-keygen -t ed25519 -N "" -f "$PRIV" <<< y >/dev/null 2>&1 || fatal "ssh-keygen failed"
   fi
-
   [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "DRY-RUN: Would export RustDesk public key" || export_rustdesk_pub_with_retries
   chmod 600 "$PRIV" 2>/dev/null || true
   chmod 644 "$PUB" 2>/dev/null || true
@@ -186,25 +156,21 @@ ensure_server_keypair() {
 # ------------------------------ Network Discovery (Recursion-Safe) ------------------------------
 discover_hosts() {
   [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would scan LAN $LAN_SUBNET"; printf '%s\n' "192.168.1.101" "192.168.1.102"; return; }
-
   require_cmd nmap || { warn "nmap missing"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
-
   mapfile -t found < <(nmap -sn "$LAN_SUBNET" 2>/dev/null | awk '/Nmap scan report for/ {print $NF}')
-
   [[ "${#found[@]}" -eq 0 ]] && { warn "No hosts discovered"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
 
   # Self-IP detection
   local self_ips=($(hostname -I | tr ' ' '\n' | grep -v '^127\.'))
   local filtered=()
   for h in "${found[@]}"; do
-    h="${h//[\(\)]/}"  # Strip parentheses
     local skip=0
     for s in "${self_ips[@]}"; do [[ "$h" == "$s" ]] && { skip=1; break; } done
     [[ "$skip" -eq 0 || "$SELF_ALLOW_MODE" -eq 1 ]] && filtered+=("$h") || log "Skipping local host IP $h to prevent recursion"
   done
 
   pass "Discovered hosts (filtered): ${filtered[*]}"
-  for h in "${filtered[@]}"; do printf '%s\n' "$h"; done
+  printf '%s\n' "${filtered[@]}"
 }
 
 # ------------------------------ SSH & Remote Ops -------------------------------
@@ -253,4 +219,17 @@ log "===== RustDesk Flatpak Key Sync START ====="
 [[ "$CLEANUP_MODE" -eq 1 ]] && pass "MODE: CLEANUP"
 [[ "$SELF_ALLOW_MODE" -eq 1 ]] && pass "MODE: SELF-ALLOW enabled (local host will be included)"
 
-auto
+auto_install_deps
+ensure_server_keypair
+
+mapfile -t HOSTS < <(discover_hosts)
+[[ "${#HOSTS[@]}" -eq 0 ]] && { warn "No hosts discovered/supplied"; exit 0; }
+pass "Hosts to process: ${HOSTS[*]}"
+
+for host in "${HOSTS[@]}"; do
+  log "---- Host: $host ----"
+  [[ "$DRY_RUN_MODE" -eq 0 ]] && ! ping -c1 -W2 "$host" &>/dev/null && { warn "$host unreachable"; continue; }
+  deploy_ssh_key_if_needed "$host" || { warn "Skipping $host due to SSH issues"; continue; }
+
+  if [[ "$CLEANUP_MODE" -eq 1 ]]; then
+    prompt_yes_no "Remove server.pub on $host?" && {
