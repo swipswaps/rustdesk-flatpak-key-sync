@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-04.8)
+# rustdesk_flatpak_key_sync.sh (v2025-11-04.9)
 # ------------------------------------------------------------------------------
-# PURPOSE:
-#   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
-#   to Flatpak clients over SSH.
-#
-#   Enhancements:
-#     - Fixed host discovery contamination (stdout vs stderr separation)
-#     - Added Avahi/mDNS fallback for mDNS-only RustDesk devices
-#     - Deduped and sorted hosts correctly
-#     - Kept all features: retries, fingerprints, smart SSH tests, etc.
+# Purpose:
+#   Self-healing RustDesk Flatpak key sync utility
+#   - Detects valid Flatpak RustDesk clients via SSH
+#   - Skips non-client hosts (e.g. Proxmox, NAS)
+#   - Keeps all advanced features: retries, mdns fallback, live logs
 # ==============================================================================
 
 set -euo pipefail
@@ -32,7 +28,7 @@ EXPORT_TMP_SUFFIX=".tmp"
 SCP_RETRIES=3
 
 # ------------------------------ Colors ------------------------------------------
-RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; RESET="\e[0m"
+RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
 
 # ------------------------------ Logging -----------------------------------------
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -41,7 +37,7 @@ chmod 644 "$LOG_FILE" 2>/dev/null || true
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; }
 pass() { printf "%b✅ %s%b\n" "$GREEN" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
 warn() { printf "%b⚠️ %s%b\n" "$YELLOW" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
-fail() { printf "%b❌ %s%b\n" "$RED" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
+info() { printf "%bℹ️ %s%b\n" "$CYAN" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
 fatal(){ printf '[%s] FATAL: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
 
 # ------------------------------ Arg Parsing -------------------------------------
@@ -111,15 +107,15 @@ export_rustdesk_pub_with_retries() {
 discover_hosts() {
   local local_ip
   local_ip="$(hostname -I | awk '{print $1}')"
-  log "Scanning LAN subnet ($LAN_SUBNET) for SSH hosts..." >&2
+  log "Scanning LAN subnet ($LAN_SUBNET) for SSH hosts..."
   mapfile -t nmap_hosts < <(nmap -p22 --open -oG - "$LAN_SUBNET" 2>/dev/null | awk '/22\/open/{print $2}' | sort -u)
   if (( ${#nmap_hosts[@]} == 0 )); then
-    warn "No SSH hosts detected via nmap." >&2
+    warn "No SSH hosts detected via nmap."
   fi
 
   local mdns_hosts=()
   if (( AVAHI_FALLBACK )); then
-    log "Running Avahi/mDNS fallback scan for .local hosts..." >&2
+    log "Running Avahi/mDNS fallback scan for .local hosts..."
     mapfile -t mdns_hosts < <(avahi-browse -art 2>/dev/null | awk -F';' '/IPv4/ && /_workstation\._tcp/ {print $8}' | sort -u)
   fi
 
@@ -136,9 +132,18 @@ discover_hosts() {
 sync_to_host() {
   local host="$1"
   log "---- Host: $host ----"
+
+  # Verify SSH port open
   if ! timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null; then
     warn "$host unreachable (SSH port closed or timeout)"
     return 1
+  fi
+
+  # Check for Flatpak RustDesk folder
+  if ! ssh -o ConnectTimeout="$SSH_TIMEOUT" -o BatchMode=yes "${CLIENT_USER}@${host}" \
+    "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" &>/dev/null; then
+    warn "$host reachable but no Flatpak RustDesk config — skipped"
+    return 2
   fi
 
   for ((i=1; i<=SCP_RETRIES; i++)); do
@@ -171,11 +176,22 @@ fi
 
 declare -A RESULT
 for host in "${HOSTS[@]}"; do
-  if sync_to_host "$host"; then RESULT["$host"]="ok"; else RESULT["$host"]="fail"; fi
+  if sync_to_host "$host"; then
+    RESULT["$host"]="ok"
+  else
+    case $? in
+      2) RESULT["$host"]="skip" ;;
+      *) RESULT["$host"]="fail" ;;
+    esac
+  fi
 done
 
 log "===== RustDesk Flatpak Key Sync COMPLETE ====="
 echo -e "\n=== Summary ==="
 for h in "${!RESULT[@]}"; do
-  if [[ ${RESULT[$h]} == ok ]]; then pass "$h synced successfully"; else warn "$h unreachable or failed"; fi
+  case "${RESULT[$h]}" in
+    ok)   pass "$h synced successfully" ;;
+    skip) info "$h skipped (no Flatpak RustDesk detected)" ;;
+    fail) warn "$h unreachable or failed" ;;
+  esac
 done
