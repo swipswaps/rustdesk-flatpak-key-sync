@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-04.5)
+# rustdesk_flatpak_key_sync.sh (v2025-11-04.8)
 # ------------------------------------------------------------------------------
 # PURPOSE:
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH.
 #
-#   Improvements:
-#     - Smart reachability check (skip offline/non-SSH hosts)
-#     - Deduped & readable host discovery logs
-#     - Extended SSH timeout for reliability
-#     - Self recursion guard retained
-#     - Auto-fingerprint verification
+#   Enhancements:
+#     - Fixed host discovery contamination (stdout vs stderr separation)
+#     - Added Avahi/mDNS fallback for mDNS-only RustDesk devices
+#     - Deduped and sorted hosts correctly
+#     - Kept all features: retries, fingerprints, smart SSH tests, etc.
 # ==============================================================================
 
 set -euo pipefail
@@ -39,51 +38,53 @@ RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; RESET="\e[0m"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
 chmod 644 "$LOG_FILE" 2>/dev/null || true
-log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
-pass() { printf "%b✅ %s%b\n" "$GREEN" "$*" "$RESET"; log "PASS: $*"; }
-warn() { printf "%b⚠️ %s%b\n" "$YELLOW" "$*" "$RESET"; log "WARN: $*"; }
-fail() { printf "%b❌ %s%b\n" "$RED" "$*" "$RESET"; log "FAIL: $*"; }
+log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; }
+pass() { printf "%b✅ %s%b\n" "$GREEN" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
+warn() { printf "%b⚠️ %s%b\n" "$YELLOW" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
+fail() { printf "%b❌ %s%b\n" "$RED" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
 fatal(){ printf '[%s] FATAL: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
 
 # ------------------------------ Arg Parsing -------------------------------------
-CLEANUP_MODE=0; DRY_RUN_MODE=0; SELF_ALLOW_MODE=0
+CLEANUP_MODE=0; DRY_RUN_MODE=0; SELF_ALLOW_MODE=0; AVAHI_FALLBACK=1
 for arg in "$@"; do
   case "$arg" in
     --cleanup) CLEANUP_MODE=1 ;;
     --dry-run|--test) DRY_RUN_MODE=1 ;;
     --self-allow) SELF_ALLOW_MODE=1 ;;
+    --no-mdns) AVAHI_FALLBACK=0 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: rustdesk_flatpak_key_sync.sh [--dry-run] [--cleanup] [--self-allow]
---dry-run / --test  : simulate actions (auto-answer prompts)
---cleanup           : remove server.pub from clients and optionally uninstall Flatpak
---self-allow        : include local host in processing (for testing)
+Usage: rustdesk_flatpak_key_sync.sh [--dry-run] [--cleanup] [--self-allow] [--no-mdns]
+--dry-run / --test : simulate actions
+--cleanup          : remove synced keys from clients
+--self-allow       : include local host in discovery
+--no-mdns          : skip Avahi/mDNS fallback discovery
 USAGE
       exit 0;;
   esac
 done
 
-# ------------------------------ Utility ----------------------------------------
+# ------------------------------ Utilities ---------------------------------------
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
 key_fingerprint() { sha256sum "$1" | awk '{print $1}'; }
-safe_mktemp() { mktemp "${TMPDIR:-/tmp}/rustdesk_key_sync.XXXXXX"; }
 
 # ------------------------------ Dependency Install ------------------------------
 auto_install_deps() {
-  log "Detecting distro for dependency installation..."
+  log "Verifying dependencies..."
   local id_like pkgmgr
   id_like="$(. /etc/os-release && echo "${ID_LIKE:-$ID}")"
   if [[ "$id_like" =~ (debian|ubuntu) ]]; then pkgmgr="apt-get"
   elif [[ "$id_like" =~ (fedora|rhel|centos|nobara) ]]; then pkgmgr="dnf"
   elif [[ "$id_like" =~ (arch|manjaro) ]]; then pkgmgr="pacman"
   else warn "Unknown distro ($id_like) — skipping auto-install"; return; fi
-  for dep in nmap ssh scp ssh-copy-id ssh-keygen openssl sha256sum flatpak; do
+
+  for dep in nmap ssh scp ssh-keygen openssl sha256sum flatpak avahi-browse; do
     if ! require_cmd "$dep"; then
       warn "Missing dependency: $dep"
       case "$pkgmgr" in
-        apt-get) sudo apt-get install -y openssh-client nmap flatpak &>>"$LOG_FILE" ;;
-        dnf) sudo dnf install -y openssh-clients nmap flatpak &>>"$LOG_FILE" ;;
-        pacman) sudo pacman -Sy --noconfirm openssh nmap flatpak &>>"$LOG_FILE" ;;
+        apt-get) sudo apt-get install -y openssh-client nmap avahi-utils flatpak &>>"$LOG_FILE" ;;
+        dnf) sudo dnf install -y openssh-clients nmap avahi flatpak &>>"$LOG_FILE" ;;
+        pacman) sudo pacman -Sy --noconfirm openssh nmap avahi flatpak &>>"$LOG_FILE" ;;
       esac
       pass "Installed dependency: $dep"
     fi
@@ -108,24 +109,30 @@ export_rustdesk_pub_with_retries() {
 
 # ------------------------------ Host Discovery ----------------------------------
 discover_hosts() {
-  log "Scanning LAN subnet ($LAN_SUBNET) for SSH hosts..."
-  local all_hosts reachable_hosts=()
-  all_hosts=($(nmap -p22 --open -oG - "$LAN_SUBNET" 2>/dev/null | awk '/22\/open/{print $2}' | sort -u))
-  if [[ ${#all_hosts[@]} -eq 0 ]]; then
-    warn "No hosts with open port 22 found in $LAN_SUBNET"
-    echo ""; return
+  local local_ip
+  local_ip="$(hostname -I | awk '{print $1}')"
+  log "Scanning LAN subnet ($LAN_SUBNET) for SSH hosts..." >&2
+  mapfile -t nmap_hosts < <(nmap -p22 --open -oG - "$LAN_SUBNET" 2>/dev/null | awk '/22\/open/{print $2}' | sort -u)
+  if (( ${#nmap_hosts[@]} == 0 )); then
+    warn "No SSH hosts detected via nmap." >&2
   fi
 
-  for h in "${all_hosts[@]}"; do
-    # Skip local host unless --self-allow
-    [[ "$h" == "$(hostname -I | awk '{print $1}')" && $SELF_ALLOW_MODE -eq 0 ]] && continue
-    reachable_hosts+=("$h")
-  done
+  local mdns_hosts=()
+  if (( AVAHI_FALLBACK )); then
+    log "Running Avahi/mDNS fallback scan for .local hosts..." >&2
+    mapfile -t mdns_hosts < <(avahi-browse -art 2>/dev/null | awk -F';' '/IPv4/ && /_workstation\._tcp/ {print $8}' | sort -u)
+  fi
 
-  printf '%s\n' "${reachable_hosts[@]}"
+  local combined=($(printf "%s\n" "${nmap_hosts[@]}" "${mdns_hosts[@]}" | sort -u))
+  local filtered=()
+  for h in "${combined[@]}"; do
+    [[ "$h" == "$local_ip" && $SELF_ALLOW_MODE -eq 0 ]] && continue
+    [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$h" =~ \.local$ ]] && filtered+=("$h")
+  done
+  printf '%s\n' "${filtered[@]}"
 }
 
-# ------------------------------ SSH Operations ----------------------------------
+# ------------------------------ SSH Sync ---------------------------------------
 sync_to_host() {
   local host="$1"
   log "---- Host: $host ----"
@@ -134,13 +141,12 @@ sync_to_host() {
     return 1
   fi
 
-  local tries=0
-  while (( ++tries <= SCP_RETRIES )); do
+  for ((i=1; i<=SCP_RETRIES; i++)); do
     if scp -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "${CLIENT_USER}@${host}:${FLATPAK_KEY_PATH}" &>>"$LOG_FILE"; then
       pass "Copied server.pub to $host"
       return 0
     else
-      warn "SCP attempt #$tries failed for $host; retrying..."
+      warn "SCP attempt #$i failed for $host; retrying..."
       sleep 2
     fi
   done
@@ -157,10 +163,10 @@ export_rustdesk_pub_with_retries
 pass "Server keypair ready. Fingerprint: $(key_fingerprint "$PUB")"
 
 mapfile -t HOSTS < <(discover_hosts)
-if [[ ${#HOSTS[@]} -eq 0 ]]; then
-  warn "No reachable SSH hosts found."
+if (( ${#HOSTS[@]} == 0 )); then
+  warn "No reachable hosts found via SSH or mDNS."
 else
-  pass "Discovered reachable hosts: ${HOSTS[*]}"
+  pass "Discovered hosts: ${HOSTS[*]}"
 fi
 
 declare -A RESULT
