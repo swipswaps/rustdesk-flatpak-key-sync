@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-03.6)
+# rustdesk_flatpak_key_sync.sh (v2025-11-04.2)
 # ------------------------------------------------------------------------------
 # PURPOSE:
 #   Manage RustDesk server keypair and synchronize RustDesk-compatible server.pub
 #   to Flatpak clients over SSH.
 #
-#   Fixed export method: uses ssh-keygen -y from private key to public key.
+#   Upgraded: Full recursion guard
+#   Added: SCP retries, verbose filtered host logging
 # ==============================================================================
 
 set -euo pipefail
@@ -26,10 +27,12 @@ VERIFY_RETRIES=2
 VERIFY_RETRY_DELAY=2
 EXPORT_RETRIES=3
 EXPORT_TMP_SUFFIX=".tmp"
+SCP_RETRIES=3
 
 # Mode flags
 CLEANUP_MODE=0
 DRY_RUN_MODE=0
+SELF_ALLOW_MODE=0
 
 # ------------------------------ Colors for UX ----------------------------------
 RED="\e[31m"
@@ -38,12 +41,10 @@ YELLOW="\e[33m"
 RESET="\e[0m"
 
 # ------------------------------ Basic setup ------------------------------------
-_log_dir="$(dirname "$LOG_FILE")"
-mkdir -p "$_log_dir" 2>/dev/null || true
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
 chmod 644 "$LOG_FILE" 2>/dev/null || true
 
-# ------------------------------ Helpers ---------------------------------------
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
 pass() { printf "%b✅ %s%b\n" "$GREEN" "$*" "$RESET"; log "PASS: $*"; }
 fail() { printf "%b❌ %s%b\n" "$RED" "$*" "$RESET"; log "FAIL: $*"; }
@@ -63,11 +64,13 @@ for arg in "$@"; do
   case "$arg" in
     --cleanup) CLEANUP_MODE=1 ;;
     --dry-run|--test) DRY_RUN_MODE=1 ;;
+    --self-allow) SELF_ALLOW_MODE=1 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: rustdesk_flatpak_key_sync.sh [--dry-run] [--cleanup]
+Usage: rustdesk_flatpak_key_sync.sh [--dry-run] [--cleanup] [--self-allow]
 --dry-run / --test  : simulate actions (auto-answer prompts)
 --cleanup           : remove server.pub from clients and optionally uninstall Flatpak
+--self-allow        : include local host in processing (for testing only)
 USAGE
       exit 0
       ;;
@@ -122,7 +125,6 @@ export_rustdesk_pub_with_retries() {
     log "Export attempt #$tries: generating RustDesk pub from $PRIV -> tmp: $tmpfile"
     [[ ! -f "$PRIV" ]] && fatal "Private key $PRIV missing; cannot export."
 
-    # Correct method: ssh-keygen -y (private -> public), base64 single-line
     if ssh-keygen -y -f "$PRIV" 2>/dev/null | base64 -w0 > "$tmpfile" 2>/dev/null; then
       :
     else
@@ -147,7 +149,6 @@ ensure_server_keypair() {
   mkdir -p "$RUSTDIR"
   chmod 700 "$RUSTDIR" 2>/dev/null || true
 
-  # Backup old keys
   if [[ -f "$PRIV" || -f "$PUB" ]]; then
     local ts backupdir
     ts="$(date '+%Y%m%d_%H%M%S')"
@@ -157,32 +158,37 @@ ensure_server_keypair() {
     log "Existing keys moved to backup: $backupdir"
   fi
 
-  # Generate private if missing
   if [[ ! -f "$PRIV" ]]; then
     require_cmd ssh-keygen || fatal "ssh-keygen missing"
-    if [[ "$DRY_RUN_MODE" -eq 1 ]]; then
-      pass "DRY-RUN: Would generate Ed25519 private key at $PRIV"
-    else
-      log "Generating Ed25519 private key at $PRIV..."
-      ssh-keygen -t ed25519 -N "" -f "$PRIV" <<< y >/dev/null 2>&1 || fatal "ssh-keygen failed"
-    fi
+    [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "DRY-RUN: Would generate Ed25519 private key at $PRIV" || ssh-keygen -t ed25519 -N "" -f "$PRIV" <<< y >/dev/null 2>&1 || fatal "ssh-keygen failed"
   fi
 
-  # Export RustDesk pub
   [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "DRY-RUN: Would export RustDesk public key" || export_rustdesk_pub_with_retries
-
   chmod 600 "$PRIV" 2>/dev/null || true
   chmod 644 "$PUB" 2>/dev/null || true
   pass "Server keypair ready. Fingerprint: $(key_fingerprint "$PUB")"
 }
 
-# ------------------------------ Network Discovery ------------------------------
+# ------------------------------ Network Discovery (Recursion-Safe) ------------------------------
 discover_hosts() {
   [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would scan LAN $LAN_SUBNET"; printf '%s\n' "192.168.1.101" "192.168.1.102"; return; }
+
   require_cmd nmap || { warn "nmap missing"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
+
   mapfile -t found < <(nmap -sn "$LAN_SUBNET" 2>/dev/null | awk '/Nmap scan report for/ {print $NF}')
   [[ "${#found[@]}" -eq 0 ]] && { warn "No hosts discovered"; read -rp "Manual IPs (space-separated) or ENTER to abort: " manual; [[ -z "$manual" ]] && return; for ip in $manual; do printf '%s\n' "$ip"; done; return; }
-  for h in "${found[@]}"; do printf '%s\n' "$h"; done
+
+  # Self-IP detection
+  local self_ips=($(hostname -I | tr ' ' '\n' | grep -v '^127\.'))
+  local filtered=()
+  for h in "${found[@]}"; do
+    local skip=0
+    for s in "${self_ips[@]}"; do [[ "$h" == "$s" ]] && { skip=1; break; } done
+    [[ "$skip" -eq 0 || "$SELF_ALLOW_MODE" -eq 1 ]] && filtered+=("$h") || log "Skipping local host IP $h to prevent recursion"
+  done
+
+  pass "Discovered hosts (filtered): ${filtered[*]}"
+  for h in "${filtered[@]}"; do printf '%s\n' "$h"; done
 }
 
 # ------------------------------ SSH & Remote Ops -------------------------------
@@ -196,10 +202,15 @@ deploy_ssh_key_if_needed() {
 }
 
 remote_copy_pub() {
-  local host="$1"
+  local host="$1" try
   [[ "$DRY_RUN_MODE" -eq 1 ]] && { pass "DRY-RUN: Would copy $PUB -> $host:~/$FLATPAK_KEY_PATH"; return; }
   ssh -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "mkdir -p \"\$(dirname ~/$FLATPAK_KEY_PATH)\"" &>>"$LOG_FILE" || warn "Cannot ensure dir on $host"
-  scp -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "$CLIENT_USER@$host:/home/$CLIENT_USER/$FLATPAK_KEY_PATH" &>>"$LOG_FILE" && pass "Copied $PUB to $host:$FLATPAK_KEY_PATH" || warn "SCP copy failed for $host"
+  for try in $(seq 1 "$SCP_RETRIES"); do
+    scp -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "$CLIENT_USER@$host:/home/$CLIENT_USER/$FLATPAK_KEY_PATH" &>>"$LOG_FILE" && { pass "Copied $PUB to $host:$FLATPAK_KEY_PATH"; return 0; }
+    warn "SCP attempt $try failed for $host; retrying..."
+    sleep 1
+  done
+  warn "SCP ultimately failed for $host after $SCP_RETRIES attempts"
 }
 
 verify_remote_pub() {
@@ -224,6 +235,7 @@ remote_restart_flatpak() {
 log "===== RustDesk Flatpak Key Sync START ====="
 [[ "$DRY_RUN_MODE" -eq 1 ]] && pass "MODE: DRY-RUN"
 [[ "$CLEANUP_MODE" -eq 1 ]] && pass "MODE: CLEANUP"
+[[ "$SELF_ALLOW_MODE" -eq 1 ]] && pass "MODE: SELF-ALLOW enabled (local host will be included)"
 
 auto_install_deps
 ensure_server_keypair
