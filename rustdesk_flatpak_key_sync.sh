@@ -36,17 +36,16 @@ RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 touch "$LOG_FILE"; chmod 644 "$LOG_FILE"
 
-log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
-pass() { printf "%b[%s] ✅ %s%b\n" "$GREEN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
-warn() { printf "%b[%s] ⚠️ %s%b\n" "$YELLOW" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
-info() { printf "%b[%s] ℹ️ %s%b\n" "$CYAN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
-fatal(){ printf "%b[%s] ❌ FATAL: %s%b\n" "$RED" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; exit 1; }
+log()  { printf -- '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
+pass() { printf -- "%b[%s] ✅ %s%b\n" "$GREEN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
+warn() { printf -- "%b[%s] ⚠️ %s%b\n" "$YELLOW" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
+info() { printf -- "%b[%s] ℹ️ %s%b\n" "$CYAN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
+fatal(){ printf -- "%b[%s] ❌ FATAL: %s%b\n" "$RED" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; exit 1; }
 
 # ------------------------------ Command Runner -----------------------------------
 run_cmd() {
   local context="$1"; shift
   log ">>> [START] $context"
-  # Corrected printf: use '--' to terminate option parsing, quote args properly
   printf -- "\n---- BEGIN COMMAND: %s ----\n" "$*" | tee -a "$LOG_FILE"
   "$@" 2>&1 | tee -a "$LOG_FILE"
   local rc=${PIPESTATUS[0]}
@@ -182,7 +181,7 @@ mapfile -t HOSTS < <(discover_hosts)
 if (( ${#HOSTS[@]} == 0 )); then warn "No hosts found"; exit 0; fi
 
 echo -e "\nDiscovered hosts:"
-for i in "${!HOSTS[@]}"; do printf "[%d] %s\n" $((i+1)) "${HOSTS[$i]}"; done
+for i in "${!HOSTS[@]}"; do printf -- "[%d] %s\n" $((i+1)) "${HOSTS[$i]}"; done
 read -rp $'\nSelect hosts to sync (comma-separated or "a" for all): ' selection
 
 declare -a SELECTED
