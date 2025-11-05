@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.4)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.5)
 # ------------------------------------------------------------------------------
 # Self-healing RustDesk Flatpak/Native key sync utility
 #  - Detects valid clients via SSH
@@ -8,6 +8,8 @@
 #  - Skips non-client hosts (e.g., NAS, Proxmox)
 #  - Preserves sudo caller SSH env
 #  - Auto-creates config folder if missing
+#  - Auto-bootstraps SSH key to new hosts (via sshpass)
+#  - Fully non-interactive with .env password list
 # ==============================================================================
 
 set -euo pipefail
@@ -29,6 +31,7 @@ EXPORT_RETRIES=3
 EXPORT_TMP_SUFFIX=".tmp"
 SCP_RETRIES=3
 AVAHI_FALLBACK=1
+ENV_FILE="${CALLER_HOME}/.rustdesk_sync_env"
 
 # ------------------------------ Colors & Logging --------------------------------
 RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
@@ -53,13 +56,13 @@ auto_install_deps() {
   elif [[ "$id_like" =~ (arch|manjaro) ]]; then pkgmgr="pacman"
   else warn "Unknown distro: $id_like"; return; fi
 
-  for dep in nmap ssh scp ssh-keygen openssl flatpak avahi-browse nc; do
+  for dep in nmap ssh scp ssh-keygen openssl flatpak avahi-browse nc sshpass; do
     require_cmd "$dep" || {
       warn "Installing $dep..."
       case "$pkgmgr" in
-        apt-get) sudo apt-get install -y openssh-client nmap avahi-utils flatpak netcat-openbsd ;;
-        dnf) sudo dnf install -y openssh-clients nmap avahi flatpak nmap-ncat ;;
-        pacman) sudo pacman -Sy --noconfirm openssh nmap avahi flatpak nmap ;;
+        apt-get) sudo apt-get install -y openssh-client nmap avahi-utils flatpak netcat-openbsd sshpass ;;
+        dnf) sudo dnf install -y openssh-clients nmap avahi flatpak nmap-ncat sshpass ;;
+        pacman) sudo pacman -Sy --noconfirm openssh nmap avahi flatpak nmap sshpass ;;
       esac &>>"$LOG_FILE"
     }
   done
@@ -97,14 +100,51 @@ discover_hosts() {
   printf '%s\n' "${filtered[@]}"
 }
 
+# ------------------------------ SSH Bootstrap -----------------------------------
+bootstrap_ssh_key() {
+  local host="$1"
+  local pass_var="SSH_PASS_${host//./_}"
+  local password=""
+
+  if [[ -f "$ENV_FILE" ]]; then
+    source "$ENV_FILE"
+    password="${!pass_var:-}"
+  fi
+
+  if [[ -z "$password" ]]; then
+    warn "No password found for $host in $ENV_FILE — skipping bootstrap"
+    return 1
+  fi
+
+  if ! require_cmd sshpass; then
+    warn "sshpass not installed, cannot bootstrap $host"
+    return 1
+  fi
+
+  info "$host: Bootstrapping SSH key via password login..."
+  sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh" &>>"$LOG_FILE" || return 1
+  sshpass -p "$password" scp -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "$CLIENT_USER@$host:~/.ssh/tmpkey.pub" &>>"$LOG_FILE" || return 1
+  sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" \
+    "cat ~/.ssh/tmpkey.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && rm -f ~/.ssh/tmpkey.pub" &>>"$LOG_FILE" || return 1
+  pass "$host: SSH key bootstrapped successfully"
+  return 0
+}
+
 # ------------------------------ SSH Validation -----------------------------------
 ensure_ssh_access() {
   local host="$1"
   timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null || return 1
-
   local ssh_opts=(-o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no -o UserKnownHostsFile="${SSH_DIR}/known_hosts" -o LogLevel=ERROR)
   if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" ssh "${ssh_opts[@]}" -o BatchMode=yes "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
     return 0
+  fi
+  warn "$host: SSH key login failed, checking for password bootstrap..."
+  if bootstrap_ssh_key "$host"; then
+    info "$host: Retesting SSH key login..."
+    if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" ssh "${ssh_opts[@]}" -o BatchMode=yes "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
+      pass "$host: SSH now passwordless"
+      return 0
+    fi
   fi
   warn "$host: SSH not ready or requires password"
   return 1
@@ -114,9 +154,7 @@ ensure_ssh_access() {
 sync_to_host() {
   local host="$1" dest_path
   log "---- Host: $host ----"
-
   local ssh_exec="sudo -u \"$CALLER_USER\" SSH_AUTH_SOCK=\"${SSH_AUTH_SOCK:-}\" ssh -o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
-
   if $ssh_exec "$CLIENT_USER@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" &>/dev/null; then
     dest_path="~/.var/app/com.rustdesk.RustDesk/config/rustdesk/server.pub"
     info "$host: Detected Flatpak RustDesk"
@@ -151,7 +189,6 @@ pass "Server key ready. Fingerprint: $(key_fingerprint "$PUB")"
 mapfile -t HOSTS < <(discover_hosts)
 if (( ${#HOSTS[@]} == 0 )); then warn "No hosts found"; exit 0; fi
 
-# ------------------------------ User Selection -----------------------------------
 echo -e "\nDiscovered hosts:"
 for i in "${!HOSTS[@]}"; do
   printf "[%d] %s\n" $((i+1)) "${HOSTS[$i]}"
@@ -168,11 +205,7 @@ else
   done
 fi
 
-if (( ${#SELECTED[@]} == 0 )); then
-  warn "No valid selections. Exiting."
-  exit 0
-fi
-
+if (( ${#SELECTED[@]} == 0 )); then warn "No valid selections. Exiting."; exit 0; fi
 pass "Selected hosts: ${SELECTED[*]}"
 
 declare -A RESULT
