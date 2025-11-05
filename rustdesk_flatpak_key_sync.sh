@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.8)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.9)
 # ------------------------------------------------------------------------------
 # MIL-STD/PRF-Compliant, Code-as-Truth Edition
 # Self-healing RustDesk Flatpak/Native key sync utility
-# - All existing features preserved.
-# - All subprocesses stream verbatim output to terminal & log (via tee).
-# - Each command prints contextual start/stop with exit codes.
-# - Fully auditable, unbuffered, human-readable in real time.
+# Fully auditable, unbuffered, human-readable in real time.
+# Fix: Prevents prepended numbering from log streaming in discovered hosts list.
 # ==============================================================================
 
 set -euo pipefail
@@ -50,8 +48,7 @@ run_cmd() {
   "$@" 2>&1 | tee -a "$LOG_FILE"
   local rc=${PIPESTATUS[0]}
   printf -- "---- END COMMAND (exit code: %d) ----\n\n" "$rc" | tee -a "$LOG_FILE"
-  if (( rc == 0 )); then pass "$context succeeded (exit $rc)"
-  else warn "$context failed (exit $rc)"; fi
+  (( rc == 0 )) && pass "$context succeeded (exit $rc)" || warn "$context failed (exit $rc)"
   return $rc
 }
 
@@ -104,16 +101,25 @@ discover_hosts() {
   local local_ip
   local_ip="$(hostname -I | awk '{print $1}')"
   info "[DISCOVERY] Scanning LAN subnet $LAN_SUBNET..."
-  run_cmd "Nmap discovery" nmap -p22 --open -oG - "$LAN_SUBNET"
-  mapfile -t nmap_hosts < <(grep '/open' "$LOG_FILE" | awk '/22\/open/{print $2}' | sort -u)
+
+  local nmap_out avahi_out
+  nmap_out="$(mktemp)"
+  avahi_out="$(mktemp)"
+
+  run_cmd "Nmap discovery" nmap -p22 --open -oG - "$LAN_SUBNET" | tee "$nmap_out" >/dev/null
+
+  mapfile -t nmap_hosts < <(awk '/22\/open/{print $2}' "$nmap_out" | sort -u)
   local mdns_hosts=()
   if (( AVAHI_FALLBACK )); then
-    run_cmd "Avahi mDNS discovery" avahi-browse -art
-    mapfile -t mdns_hosts < <(grep "_workstation._tcp" "$LOG_FILE" | awk -F';' '/IPv4/ {print $8}' | sort -u)
+    run_cmd "Avahi mDNS discovery" avahi-browse -art | tee "$avahi_out" >/dev/null
+    mapfile -t mdns_hosts < <(awk -F';' '/IPv4/ {print $8}' "$avahi_out" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
   fi
+
   local combined=($(printf "%s\n" "${nmap_hosts[@]}" "${mdns_hosts[@]}" | sort -u))
   local filtered=()
   for h in "${combined[@]}"; do [[ "$h" != "$local_ip" ]] && filtered+=("$h"); done
+
+  rm -f "$nmap_out" "$avahi_out"
   printf '%s\n' "${filtered[@]}"
 }
 
@@ -152,9 +158,9 @@ sync_to_host() {
   local host="$1" dest_path
   log "[SYNC] Host: $host"
   local ssh_exec=(sudo -u "$CALLER_USER" ssh -o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o UserKnownHostsFile=${SSH_DIR}/known_hosts)
-  if "${ssh_exec[@]}" "$CLIENT_USER@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" | tee -a "$LOG_FILE"; then
+  if "${ssh_exec[@]}" "$CLIENT_USER@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk"; then
     dest_path="~/.var/app/com.rustdesk.RustDesk/config/rustdesk/server.pub"
-  elif "${ssh_exec[@]}" "$CLIENT_USER@$host" "test -d ~/.config/rustdesk" | tee -a "$LOG_FILE"; then
+  elif "${ssh_exec[@]}" "$CLIENT_USER@$host" "test -d ~/.config/rustdesk"; then
     dest_path="~/.config/rustdesk/server.pub"
   else
     run_cmd "$host: mkdir ~/.config/rustdesk" "${ssh_exec[@]}" "$CLIENT_USER@$host" "mkdir -p ~/.config/rustdesk"
