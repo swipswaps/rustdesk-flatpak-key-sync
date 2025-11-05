@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.2)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.3)
 # ------------------------------------------------------------------------------
 # Purpose:
 #   Self-healing RustDesk Flatpak/Native key sync utility
@@ -8,6 +8,7 @@
 #   - Skips non-client hosts (e.g. Proxmox, NAS)
 #   - Auto-creates config folder if missing
 #   - Keeps retries, mDNS fallback, live logs
+#   - FIX: SSH detection works even under sudo (uses caller’s SSH environment)
 # ==============================================================================
 
 set -euo pipefail
@@ -17,6 +18,9 @@ shopt -s extglob
 RUSTDIR="/var/lib/rustdesk-server"
 PRIV="${RUSTDIR}/id_ed25519"
 PUB="${RUSTDIR}/id_ed25519.pub"
+CALLER_USER="${SUDO_USER:-$USER}"
+CALLER_HOME="$(getent passwd "$CALLER_USER" | cut -d: -f6)"
+SSH_DIR="${CALLER_HOME}/.ssh"
 CLIENT_USER="owner"
 LAN_SUBNET="192.168.1.0/24"
 LOG_FILE="/var/log/rustdesk_flatpak_key_sync.log"
@@ -112,10 +116,26 @@ discover_hosts() {
 ensure_ssh_access() {
   local host="$1"
   timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null || return 1
-  if ssh -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
+
+  local ssh_opts=(
+    -o ConnectTimeout="$SSH_TIMEOUT"
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile="${SSH_DIR}/known_hosts"
+    -o LogLevel=ERROR
+  )
+
+  # Try key-based first (BatchMode)
+  if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" ssh "${ssh_opts[@]}" -o BatchMode=yes "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
     return 0
   fi
-  warn "$host: no passwordless SSH yet"
+
+  # If that failed, try normal SSH (to handle passphrase agents)
+  if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" ssh "${ssh_opts[@]}" "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
+    warn "$host: Connected via interactive SSH (agent/passphrase likely used)"
+    return 0
+  fi
+
+  warn "$host: no SSH access yet (check agent or authorized_keys)"
   return 1
 }
 
@@ -126,26 +146,23 @@ sync_to_host() {
 
   timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null || { warn "$host SSH closed"; return 1; }
 
-  # detect user
-  local remote_user
-  remote_user="$(ssh -o ConnectTimeout=$SSH_TIMEOUT "$CLIENT_USER@$host" 'whoami' 2>/dev/null || true)"
-  [[ -z "$remote_user" ]] && remote_user="$CLIENT_USER"
+  local remote_user="$CLIENT_USER"
+  local ssh_exec="sudo -u \"$CALLER_USER\" SSH_AUTH_SOCK=\"${SSH_AUTH_SOCK:-}\" ssh -o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
 
-  # detect RustDesk install type
-  if ssh "$remote_user@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" &>/dev/null; then
+  if $ssh_exec "$remote_user@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" &>/dev/null; then
     dest_path="~/.var/app/com.rustdesk.RustDesk/config/rustdesk/server.pub"
     info "$host: Detected Flatpak RustDesk"
-  elif ssh "$remote_user@$host" "test -d ~/.config/rustdesk" &>/dev/null; then
+  elif $ssh_exec "$remote_user@$host" "test -d ~/.config/rustdesk" &>/dev/null; then
     dest_path="~/.config/rustdesk/server.pub"
     info "$host: Detected native RustDesk"
   else
     warn "$host: No RustDesk config folder found — creating ~/.config/rustdesk"
-    ssh "$remote_user@$host" "mkdir -p ~/.config/rustdesk" &>>"$LOG_FILE" || { warn "$host: cannot create dir"; return 2; }
+    $ssh_exec "$remote_user@$host" "mkdir -p ~/.config/rustdesk" &>>"$LOG_FILE" || { warn "$host: cannot create dir"; return 2; }
     dest_path="~/.config/rustdesk/server.pub"
   fi
 
   for ((i=1; i<=SCP_RETRIES; i++)); do
-    if scp -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "${remote_user}@${host}:${dest_path}" &>>"$LOG_FILE"; then
+    if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" scp -o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no "$PUB" "${remote_user}@${host}:${dest_path}" &>>"$LOG_FILE"; then
       pass "$host: Key synced to ${dest_path}"
       return 0
     fi
@@ -172,7 +189,6 @@ for host in "${HOSTS[@]}"; do
   if ensure_ssh_access "$host"; then
     sync_to_host "$host" && RESULT["$host"]="ok" || RESULT["$host"]="fail"
   else
-    warn "$host: SSH access not ready"
     RESULT["$host"]="unreachable"
   fi
 done
