@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.1)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.2)
 # ------------------------------------------------------------------------------
 # Purpose:
 #   Self-healing RustDesk Flatpak/Native key sync utility
@@ -27,6 +27,7 @@ EXPORT_RETRIES=3
 EXPORT_TMP_SUFFIX=".tmp"
 SCP_RETRIES=3
 AVAHI_FALLBACK=1
+DRY_RUN_MODE=0
 
 # ------------------------------ Colors & Logging --------------------------------
 RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
@@ -107,19 +108,30 @@ discover_hosts() {
   printf '%s\n' "${filtered[@]}"
 }
 
+# ------------------------------ SSH Key Pre-check -------------------------------
+ensure_ssh_access() {
+  local host="$1"
+  timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null || return 1
+  if ssh -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
+    return 0
+  fi
+  warn "$host: no passwordless SSH yet"
+  return 1
+}
+
 # ------------------------------ SSH Sync ---------------------------------------
 sync_to_host() {
-  local host="$1" dest_path user_path pub_dest
+  local host="$1" dest_path
   log "---- Host: $host ----"
 
   timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null || { warn "$host SSH closed"; return 1; }
 
-  # Detect remote username if not default
+  # detect user
   local remote_user
   remote_user="$(ssh -o ConnectTimeout=$SSH_TIMEOUT "$CLIENT_USER@$host" 'whoami' 2>/dev/null || true)"
   [[ -z "$remote_user" ]] && remote_user="$CLIENT_USER"
 
-  # Detect RustDesk install type
+  # detect RustDesk install type
   if ssh "$remote_user@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" &>/dev/null; then
     dest_path="~/.var/app/com.rustdesk.RustDesk/config/rustdesk/server.pub"
     info "$host: Detected Flatpak RustDesk"
@@ -132,7 +144,6 @@ sync_to_host() {
     dest_path="~/.config/rustdesk/server.pub"
   fi
 
-  # SCP with retries
   for ((i=1; i<=SCP_RETRIES; i++)); do
     if scp -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "${remote_user}@${host}:${dest_path}" &>>"$LOG_FILE"; then
       pass "$host: Key synced to ${dest_path}"
@@ -158,10 +169,11 @@ pass "Hosts found: ${HOSTS[*]}"
 
 declare -A RESULT
 for host in "${HOSTS[@]}"; do
-  if sync_to_host "$host"; then
-    RESULT["$host"]="ok"
+  if ensure_ssh_access "$host"; then
+    sync_to_host "$host" && RESULT["$host"]="ok" || RESULT["$host"]="fail"
   else
-    RESULT["$host"]="fail"
+    warn "$host: SSH access not ready"
+    RESULT["$host"]="unreachable"
   fi
 done
 
@@ -170,6 +182,7 @@ echo -e "\n=== Summary ==="
 for h in "${!RESULT[@]}"; do
   case "${RESULT[$h]}" in
     ok)   pass "$h synced successfully" ;;
-    fail) warn "$h failed" ;;
+    fail) warn "$h failed during sync" ;;
+    unreachable) warn "$h not reachable via SSH" ;;
   esac
 done
