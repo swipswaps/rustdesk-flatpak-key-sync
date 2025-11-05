@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.7)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.8)
 # ------------------------------------------------------------------------------
 # MIL-STD/PRF-Compliant, Code-as-Truth Edition
 # Self-healing RustDesk Flatpak/Native key sync utility
@@ -46,10 +46,11 @@ fatal(){ printf "%b[%s] ❌ FATAL: %s%b\n" "$RED" "$(date '+%F %T')" "$*" "$RESE
 run_cmd() {
   local context="$1"; shift
   log ">>> [START] $context"
-  printf "\n---- BEGIN COMMAND: %s ----\n" "$*" | tee -a "$LOG_FILE"
+  # Corrected printf: use '--' to terminate option parsing, quote args properly
+  printf -- "\n---- BEGIN COMMAND: %s ----\n" "$*" | tee -a "$LOG_FILE"
   "$@" 2>&1 | tee -a "$LOG_FILE"
   local rc=${PIPESTATUS[0]}
-  printf "---- END COMMAND (exit code: %d) ----\n\n" "$rc" | tee -a "$LOG_FILE"
+  printf -- "---- END COMMAND (exit code: %d) ----\n\n" "$rc" | tee -a "$LOG_FILE"
   if (( rc == 0 )); then pass "$context succeeded (exit $rc)"
   else warn "$context failed (exit $rc)"; fi
   return $rc
