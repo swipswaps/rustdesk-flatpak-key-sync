@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.3)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.4)
 # ------------------------------------------------------------------------------
-# Purpose:
-#   Self-healing RustDesk Flatpak/Native key sync utility
-#   - Detects valid RustDesk clients (Flatpak or native) via SSH
-#   - Skips non-client hosts (e.g. Proxmox, NAS)
-#   - Auto-creates config folder if missing
-#   - Keeps retries, mDNS fallback, live logs
-#   - FIX: SSH detection works even under sudo (uses caller’s SSH environment)
+# Self-healing RustDesk Flatpak/Native key sync utility
+#  - Detects valid clients via SSH
+#  - Lists discovered hosts for user confirmation before sync
+#  - Skips non-client hosts (e.g., NAS, Proxmox)
+#  - Preserves sudo caller SSH env
+#  - Auto-creates config folder if missing
 # ==============================================================================
 
 set -euo pipefail
@@ -26,12 +25,10 @@ LAN_SUBNET="192.168.1.0/24"
 LOG_FILE="/var/log/rustdesk_flatpak_key_sync.log"
 SSH_TIMEOUT=10
 VERIFY_RETRIES=2
-VERIFY_RETRY_DELAY=2
 EXPORT_RETRIES=3
 EXPORT_TMP_SUFFIX=".tmp"
 SCP_RETRIES=3
 AVAHI_FALLBACK=1
-DRY_RUN_MODE=0
 
 # ------------------------------ Colors & Logging --------------------------------
 RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
@@ -43,16 +40,6 @@ pass() { printf "%b✅ %s%b\n" "$GREEN" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; 
 warn() { printf "%b⚠️ %s%b\n" "$YELLOW" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
 info() { printf "%bℹ️ %s%b\n" "$CYAN" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
 fatal(){ printf '[%s] FATAL: %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
-
-# ------------------------------ Args --------------------------------------------
-SELF_ALLOW_MODE=0
-for arg in "$@"; do
-  case "$arg" in
-    --self-allow) SELF_ALLOW_MODE=1 ;;
-    --no-mdns) AVAHI_FALLBACK=0 ;;
-    --dry-run|--test) DRY_RUN_MODE=1 ;;
-  esac
-done
 
 # ------------------------------ Dependencies ------------------------------------
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -99,43 +86,27 @@ discover_hosts() {
   local_ip="$(hostname -I | awk '{print $1}')"
   log "Scanning LAN subnet ($LAN_SUBNET)..."
   mapfile -t nmap_hosts < <(nmap -p22 --open -oG - "$LAN_SUBNET" 2>/dev/null | awk '/22\/open/{print $2}' | sort -u)
-
   local mdns_hosts=()
   (( AVAHI_FALLBACK )) && mapfile -t mdns_hosts < <(avahi-browse -art 2>/dev/null | awk -F';' '/IPv4/ && /_workstation\._tcp/ {print $8}' | sort -u)
   local combined=($(printf "%s\n" "${nmap_hosts[@]}" "${mdns_hosts[@]}" | sort -u))
-
   local filtered=()
   for h in "${combined[@]}"; do
-    [[ "$h" == "$local_ip" && $SELF_ALLOW_MODE -eq 0 ]] && continue
+    [[ "$h" == "$local_ip" ]] && continue
     filtered+=("$h")
   done
   printf '%s\n' "${filtered[@]}"
 }
 
-# ------------------------------ SSH Key Pre-check -------------------------------
+# ------------------------------ SSH Validation -----------------------------------
 ensure_ssh_access() {
   local host="$1"
   timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null || return 1
 
-  local ssh_opts=(
-    -o ConnectTimeout="$SSH_TIMEOUT"
-    -o StrictHostKeyChecking=no
-    -o UserKnownHostsFile="${SSH_DIR}/known_hosts"
-    -o LogLevel=ERROR
-  )
-
-  # Try key-based first (BatchMode)
+  local ssh_opts=(-o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no -o UserKnownHostsFile="${SSH_DIR}/known_hosts" -o LogLevel=ERROR)
   if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" ssh "${ssh_opts[@]}" -o BatchMode=yes "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
     return 0
   fi
-
-  # If that failed, try normal SSH (to handle passphrase agents)
-  if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" ssh "${ssh_opts[@]}" "$CLIENT_USER@$host" 'echo ok' &>/dev/null; then
-    warn "$host: Connected via interactive SSH (agent/passphrase likely used)"
-    return 0
-  fi
-
-  warn "$host: no SSH access yet (check agent or authorized_keys)"
+  warn "$host: SSH not ready or requires password"
   return 1
 }
 
@@ -144,25 +115,22 @@ sync_to_host() {
   local host="$1" dest_path
   log "---- Host: $host ----"
 
-  timeout "$SSH_TIMEOUT" bash -c "nc -z -w3 $host 22" &>/dev/null || { warn "$host SSH closed"; return 1; }
-
-  local remote_user="$CLIENT_USER"
   local ssh_exec="sudo -u \"$CALLER_USER\" SSH_AUTH_SOCK=\"${SSH_AUTH_SOCK:-}\" ssh -o ConnectTimeout=$SSH_TIMEOUT -o StrictHostKeyChecking=no -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
 
-  if $ssh_exec "$remote_user@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" &>/dev/null; then
+  if $ssh_exec "$CLIENT_USER@$host" "test -d ~/.var/app/com.rustdesk.RustDesk/config/rustdesk" &>/dev/null; then
     dest_path="~/.var/app/com.rustdesk.RustDesk/config/rustdesk/server.pub"
     info "$host: Detected Flatpak RustDesk"
-  elif $ssh_exec "$remote_user@$host" "test -d ~/.config/rustdesk" &>/dev/null; then
+  elif $ssh_exec "$CLIENT_USER@$host" "test -d ~/.config/rustdesk" &>/dev/null; then
     dest_path="~/.config/rustdesk/server.pub"
     info "$host: Detected native RustDesk"
   else
-    warn "$host: No RustDesk config folder found — creating ~/.config/rustdesk"
-    $ssh_exec "$remote_user@$host" "mkdir -p ~/.config/rustdesk" &>>"$LOG_FILE" || { warn "$host: cannot create dir"; return 2; }
+    warn "$host: No RustDesk config found — creating ~/.config/rustdesk"
+    $ssh_exec "$CLIENT_USER@$host" "mkdir -p ~/.config/rustdesk" &>>"$LOG_FILE" || { warn "$host: cannot create dir"; return 2; }
     dest_path="~/.config/rustdesk/server.pub"
   fi
 
   for ((i=1; i<=SCP_RETRIES; i++)); do
-    if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" scp -o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no "$PUB" "${remote_user}@${host}:${dest_path}" &>>"$LOG_FILE"; then
+    if sudo -u "$CALLER_USER" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" scp -o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no "$PUB" "${CLIENT_USER}@${host}:${dest_path}" &>>"$LOG_FILE"; then
       pass "$host: Key synced to ${dest_path}"
       return 0
     fi
@@ -182,10 +150,33 @@ pass "Server key ready. Fingerprint: $(key_fingerprint "$PUB")"
 
 mapfile -t HOSTS < <(discover_hosts)
 if (( ${#HOSTS[@]} == 0 )); then warn "No hosts found"; exit 0; fi
-pass "Hosts found: ${HOSTS[*]}"
+
+# ------------------------------ User Selection -----------------------------------
+echo -e "\nDiscovered hosts:"
+for i in "${!HOSTS[@]}"; do
+  printf "[%d] %s\n" $((i+1)) "${HOSTS[$i]}"
+done
+read -rp $'\nSelect hosts to sync (comma-separated or "a" for all): ' selection
+
+declare -a SELECTED
+if [[ "$selection" =~ ^[Aa]$ ]]; then
+  SELECTED=("${HOSTS[@]}")
+else
+  IFS=',' read -ra choices <<< "$selection"
+  for c in "${choices[@]}"; do
+    (( c>=1 && c<=${#HOSTS[@]} )) && SELECTED+=("${HOSTS[$((c-1))]}")
+  done
+fi
+
+if (( ${#SELECTED[@]} == 0 )); then
+  warn "No valid selections. Exiting."
+  exit 0
+fi
+
+pass "Selected hosts: ${SELECTED[*]}"
 
 declare -A RESULT
-for host in "${HOSTS[@]}"; do
+for host in "${SELECTED[@]}"; do
   if ensure_ssh_access "$host"; then
     sync_to_host "$host" && RESULT["$host"]="ok" || RESULT["$host"]="fail"
   else
