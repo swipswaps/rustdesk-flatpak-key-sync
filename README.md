@@ -1,152 +1,99 @@
-# rustdesk_flatpak_key_sync.sh
+# RustDesk Flatpak Key Sync
 
-## Overview
+This repository contains a powerful Bash script (`rustdesk_key_sync.sh`) designed to automate the synchronization of a self-hosted RustDesk server's public key to multiple clients on a local network (LAN). It simplifies the often tedious process of manually configuring clients to trust a new or existing self-hosted RustDesk server.
 
-`rustdesk_flatpak_key_sync.sh` is a fully automated Bash script to manage RustDesk server keypairs and synchronize the RustDesk-compatible `server.pub` key to Flatpak clients across a LAN.  
+This script is particularly useful for users who run their own RustDesk server and want a seamless way to manage client connections, including those running the Flatpak version of RustDesk.
 
-It ensures:
+## Key Features
 
-- Server Ed25519 keypair exists and is RustDesk-compatible
-- Dependencies (`ssh`, `nmap`, `openssl`, `flatpak`) are installed automatically
-- LAN clients are discovered via `nmap` or manually entered
-- Passwordless SSH setup is deployed if needed
-- Remote `server.pub` is copied and verified with SHA256 fingerprints
-- Optional cleanup and uninstallation mode
+- **Automatic Host Discovery:** Scans the local network to find potential client machines running an SSH server.
+- **Interactive Host Selection:** Presents a menu of discovered hosts, allowing you to choose which clients to sync.
+- **Automatic SSH Key Bootstrapping:** If password-less (key-based) SSH access to a client is not already configured, the script will attempt to use `ssh-copy-id` to install the necessary SSH key, prompting for a password only once per client.
+- **Secure Password Caching:** For convenience, client SSH passwords can be securely cached in an environment file (`~/.rustdesk_sync_env`) for the duration of the session. This file is created with secure permissions (600).
+- **Context-Aware `sudo` Execution:** The script correctly handles being run with `sudo`, ensuring that all SSH and file operations are performed as the original user, not as root. This avoids common permission and context issues.
+- **Cross-Platform Compatibility:** Automatically detects the Linux distribution (Debian/Ubuntu, Fedora/RHEL, Arch/Manjaro) and installs any missing dependencies like `nmap`, `sshpass`, and `avahi-utils`.
+- **Flatpak and Standard Path Detection:** Intelligently determines whether the client is using the Flatpak version of RustDesk or a standard installation and places the server key in the correct directory.
+- **Detailed Logging:** All actions are logged to both the console and a system log file (`/var/log/rustdesk_flatpak_key_sync.log`) for easy debugging and auditing.
 
-All steps are logged with timestamps to `/var/log/rustdesk_flatpak_key_sync.log`.
+## How to Use
 
----
+### 1. Prerequisites
 
-## Table of Contents
+- A self-hosted RustDesk server running on a Linux machine.
+- One or more Linux client machines on the same local network.
+- SSH server installed and running on each client machine.
+- Your user account on the server must have `sudo` privileges.
 
-- [Prerequisites](#prerequisites)  
-- [Installation](#installation)  
-- [Usage](#usage)  
-- [Modes](#modes)  
-- [Structure](#structure)  
-- [Troubleshooting](#troubleshooting)  
-- [Cleanup Examples](#cleanup-examples)  
-- [Logging](#logging)  
+### 2. Installation
 
----
+1.  **Clone this repository** to your RustDesk server machine:
 
-## Prerequisites
+    ```bash
+    git clone https://github.com/swipswaps/rustdesk-flatpak-key-sync.git
+    cd rustdesk-flatpak-key-sync
+    ```
 
-- Bash (≥4.0)  
-- `ssh`, `ssh-keygen`, `ssh-copy-id`  
-- `scp`  
-- `openssl`  
-- `nmap`  
-- `flatpak` (client machines)  
+2.  **Make the script executable**:
 
-The script auto-installs missing dependencies for Debian/Ubuntu, Fedora/RHEL, and Arch/Manjaro families.
+    ```bash
+    chmod +x rustdesk_key_sync.sh
+    ```
 
----
+### 3. Execution
 
-## Installation
-
-Clone or download the script and make it executable:
+Run the script with `sudo`. The `-E` flag is recommended to preserve the user environment, which helps the script identify the correct user home directory.
 
 ```bash
-chmod +x rustdesk_flatpak_key_sync.sh
+sudo -E bash rustdesk_key_sync.sh
+```
 
-Run as a user with sudo privileges (for package installation and key generation):
+**What the script will do:**
 
-./rustdesk_flatpak_key_sync.sh
+1.  **Check Dependencies:** It will first check if all required tools are installed and, if not, will attempt to install them using your system's package manager.
+2.  **Generate/Verify Keys:** It ensures your RustDesk server has a valid keypair in `/var/lib/rustdesk-server`. If not, it will generate one.
+3.  **Discover Hosts:** It will scan your network and list all the client machines it finds.
+4.  **Interactive Menu:** It will present you with a menu of discovered hosts. You can choose to sync to a single host, all of them, or quit.
+5.  **Sync Process:** For each selected host:
+    *   It will try to connect via SSH using your existing SSH keys.
+    *   If that fails, it will prompt you for the client's SSH password to set up key-based authentication for future runs.
+    *   Once connected, it will copy the RustDesk server's public key to the correct location on the client.
 
-Usage
-Basic Deployment
+## Configuration
 
-./rustdesk_flatpak_key_sync.sh
+The script includes a configuration section at the top where you can modify default settings:
 
-    Auto-discovers LAN hosts on LAN_SUBNET (default 192.168.1.0/24)
+- `CLIENT_USER`: The username on the client machines (default: `"owner"`).
+- `LAN_SUBNET`: The network subnet to scan (default: `"192.168.1.0/24"`).
 
-    Prompts for manual hosts not discovered
+## Troubleshooting
 
-    Ensures server keypair exists and is RustDesk-compatible
+- **SSH Connection Fails:**
+    - Ensure the SSH server is running on the client machine (`sudo systemctl status sshd`).
+    - Verify that the `CLIENT_USER` and password are correct.
+    - Check your firewall settings on both the server and client to ensure port 22 is not blocked.
 
-    Deploys server.pub to all reachable clients
+- **"Permissions on .rustdesk_sync_env are not 600" Warning:**
+    - This is a security precaution. Run `chmod 600 ~/.rustdesk_sync_env` to secure the file where your temporary passwords may be cached.
 
-    Verifies SHA256 fingerprints for each host
+- **"No hosts discovered" Message:**
+    - Double-check that your `LAN_SUBNET` variable in the script is set correctly for your network.
+    - Ensure the client machines are powered on and connected to the same network.
 
-    Logs all events and errors
+- **"Key-based auth failed" and Bootstrap Fails:**
+    - This can happen if the client's SSH server is configured to disallow password authentication entirely (`PasswordAuthentication no` in `sshd_config`). In this case, you will need to manually copy your SSH key to the client first:
+      ```bash
+      # On your server, run this and follow the prompts
+      ssh-copy-id owner@client-ip-address
+      ```
 
-Cleanup / Uninstall Mode
+## How It Works: The Technical Details
 
-./rustdesk_flatpak_key_sync.sh --cleanup
+This script solves a common problem when running commands with `sudo`: **context loss**. When you run a script with `sudo`, it executes as the `root` user. If that script then tries to perform SSH operations, it will look for keys and configurations in `root`'s home directory (`/root/.ssh`), not your own user's (`/home/youruser/.ssh`).
 
-    Removes remote server.pub
+The script cleverly works around this by:
 
-    Optionally uninstalls Flatpak RustDesk on the client
+1.  Using `SUDO_USER` to identify the original user who invoked `sudo`.
+2.  Explicitly running all SSH and SCP commands within the context of that original user via `sudo -u $CALLER_USER ...`.
+3.  Storing cached passwords in the user's home directory, not a system-wide location.
 
-    Interactive prompts ensure safe cleanup
-
-Structure
-Section	Purpose
-Configuration	Set server directory, key paths, LAN subnet, SSH settings, log file
-Logging	log() and fatal() functions write timestamped logs
-Utilities	Fingerprint calculation, temporary files, SSH requirement checks
-Dependency Installation	auto_install_deps() installs missing packages based on detected distro
-Keypair Handling	ensure_server_keypair() generates private key and RustDesk-compatible public key
-Remote Helpers	SSH key deployment, remote exec/copy, verification of remote keys
-Abstracted Test Flow	run_self_test() validates environment without user intervention
-Main Flow	LAN discovery, host deduplication, key deployment, verification, optional cleanup
-Troubleshooting
-Common Issues
-Issue	Cause	Solution
-Remote key mismatch	Remote server.pub differs from local DER format	Script retries copy; ensure server keypair is valid
-SSH connection fails	Passwordless SSH not set	Deploy key automatically or manually copy $HOME/.ssh/id_ed25519.pub
-Flatpak RustDesk missing	Client does not have RustDesk installed	Script prompts for installation; ensure Flathub repo is available
-Dependency missing	Command not found	Script installs automatically if sudo is available; else install manually
-Key Mismatch Handling
-
-    Script calculates SHA256 fingerprints of local and remote server.pub.
-
-    If mismatch occurs:
-
-        Retry copy up to 2 times (configurable via VERIFY_RETRIES)
-
-        Logs first 160 characters of remote key for debugging
-
-    Persistent mismatch may indicate:
-
-        Old/corrupted keys on client
-
-        Incorrect file permissions (chmod 644 recommended)
-
-        RustDesk not restarted after previous key update
-
-Cleanup Examples
-Remove server.pub from a single host
-
-./rustdesk_flatpak_key_sync.sh --cleanup
-
-    Prompts for confirmation per host
-
-Remove key and uninstall RustDesk
-
-    During --cleanup mode, the script asks:
-
-Also uninstall Flatpak RustDesk on <host>?
-
-    Answer y to uninstall
-
-Logging
-
-    All actions, warnings, errors, and events are logged to:
-
-/var/log/rustdesk_flatpak_key_sync.log
-
-    Each log entry is timestamped for audit and debugging purposes
-
-Notes
-
-    Script is idempotent: re-running does not break existing deployments
-
-    Abstracted self-test ensures server key and environment are valid before deployment
-
-    Supports Debian/Ubuntu, Fedora/RHEL, CentOS/Nobara, Arch/Manjaro
-
-Author
-
-Jose Melendez – 2025-11-03
+This ensures that your personal SSH keys and configuration are always used, allowing both key-based authentication and the one-time password bootstrap to function as expected.
