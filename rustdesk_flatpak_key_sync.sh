@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.9)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.11)
 # ------------------------------------------------------------------------------
-# MIL-STD/PRF-Compliant, Code-as-Truth Edition
-# Self-healing RustDesk Flatpak/Native key sync utility
-# Fully auditable, unbuffered, human-readable in real time.
-# Fix: Prevents prepended numbering from log streaming in discovered hosts list.
+# Fix: Adds permission-safe temp copy for pubkey so non-root scp succeeds.
+#      Keeps all existing features: retries, discovery, logging, filtering.
 # ==============================================================================
-
 set -euo pipefail
 shopt -s extglob
 
-# ------------------------------ Configuration -----------------------------------
 RUSTDIR="/var/lib/rustdesk-server"
 PRIV="${RUSTDIR}/id_ed25519"
 PUB="${RUSTDIR}/id_ed25519.pub"
+TMP_PUB="/tmp/rustdesk_sync_key.pub"
 CALLER_USER="${SUDO_USER:-$USER}"
 CALLER_HOME="$(getent passwd "$CALLER_USER" | cut -d: -f6)"
 SSH_DIR="${CALLER_HOME}/.ssh"
@@ -29,30 +26,27 @@ SCP_RETRIES=3
 AVAHI_FALLBACK=1
 ENV_FILE="${CALLER_HOME}/.rustdesk_sync_env"
 
-# ------------------------------ Colors & Logging --------------------------------
 RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 touch "$LOG_FILE"; chmod 644 "$LOG_FILE"
 
-log()  { printf -- '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
-pass() { printf -- "%b[%s] ✅ %s%b\n" "$GREEN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
-warn() { printf -- "%b[%s] ⚠️ %s%b\n" "$YELLOW" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
-info() { printf -- "%b[%s] ℹ️ %s%b\n" "$CYAN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; }
-fatal(){ printf -- "%b[%s] ❌ FATAL: %s%b\n" "$RED" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE"; exit 1; }
+log()  { printf -- '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE" >&2; }
+pass() { printf -- "%b[%s] ✅ %s%b\n" "$GREEN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
+warn() { printf -- "%b[%s] ⚠️ %s%b\n" "$YELLOW" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
+info() { printf -- "%b[%s] ℹ️ %s%b\n" "$CYAN" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; }
+fatal(){ printf -- "%b[%s] ❌ FATAL: %s%b\n" "$RED" "$(date '+%F %T')" "$*" "$RESET" | tee -a "$LOG_FILE" >&2; exit 1; }
 
-# ------------------------------ Command Runner -----------------------------------
 run_cmd() {
   local context="$1"; shift
   log ">>> [START] $context"
-  printf -- "\n---- BEGIN COMMAND: %s ----\n" "$*" | tee -a "$LOG_FILE"
+  printf -- "\n---- BEGIN COMMAND: %s ----\n" "$*" | tee -a "$LOG_FILE" >&2
   "$@" 2>&1 | tee -a "$LOG_FILE"
   local rc=${PIPESTATUS[0]}
-  printf -- "---- END COMMAND (exit code: %d) ----\n\n" "$rc" | tee -a "$LOG_FILE"
+  printf -- "---- END COMMAND (exit code: %d) ----\n\n" "$rc" | tee -a "$LOG_FILE" >&2
   (( rc == 0 )) && pass "$context succeeded (exit $rc)" || warn "$context failed (exit $rc)"
   return $rc
 }
 
-# ------------------------------ Dependencies ------------------------------------
 require_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 auto_install_deps() {
@@ -77,7 +71,6 @@ auto_install_deps() {
   pass "Dependencies verified"
 }
 
-# ------------------------------ Keypair -----------------------------------------
 key_fingerprint() { sha256sum "$1" | awk '{print $1}'; }
 
 export_rustdesk_pub_with_retries() {
@@ -96,11 +89,10 @@ export_rustdesk_pub_with_retries() {
   fatal "Failed to export RustDesk pubkey"
 }
 
-# ------------------------------ Discovery ---------------------------------------
 discover_hosts() {
   local local_ip
   local_ip="$(hostname -I | awk '{print $1}')"
-  info "[DISCOVERY] Scanning LAN subnet $LAN_SUBNET..."
+  info "[DISCOVERY] Scanning LAN subnet $LAN_SUBNET..." >&2
 
   local nmap_out avahi_out
   nmap_out="$(mktemp)"
@@ -123,7 +115,6 @@ discover_hosts() {
   printf '%s\n' "${filtered[@]}"
 }
 
-# ------------------------------ SSH Bootstrap -----------------------------------
 bootstrap_ssh_key() {
   local host="$1"
   local pass_var="SSH_PASS_${host//./_}"
@@ -133,11 +124,10 @@ bootstrap_ssh_key() {
   [[ -z "$password" ]] && { warn "$host: No password in $ENV_FILE"; return 1; }
 
   run_cmd "$host: mkdir ~/.ssh" sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-  run_cmd "$host: upload pubkey" sshpass -p "$password" scp -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$PUB" "$CLIENT_USER@$host:~/.ssh/tmpkey.pub"
+  run_cmd "$host: upload pubkey" sshpass -p "$password" scp -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$TMP_PUB" "$CLIENT_USER@$host:~/.ssh/tmpkey.pub"
   run_cmd "$host: append pubkey" sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "cat ~/.ssh/tmpkey.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && rm -f ~/.ssh/tmpkey.pub"
 }
 
-# ------------------------------ SSH Validation -----------------------------------
 ensure_ssh_access() {
   local host="$1"
   run_cmd "$host: test TCP/22 connectivity" nc -z -w3 "$host" 22
@@ -153,7 +143,6 @@ ensure_ssh_access() {
   fi
 }
 
-# ------------------------------ SSH Sync ---------------------------------------
 sync_to_host() {
   local host="$1" dest_path
   log "[SYNC] Host: $host"
@@ -168,7 +157,7 @@ sync_to_host() {
   fi
 
   for ((i=1; i<=SCP_RETRIES; i++)); do
-    run_cmd "$host: scp pubkey attempt $i" sudo -u "$CALLER_USER" scp -o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no "$PUB" "${CLIENT_USER}@${host}:${dest_path}" && return 0
+    run_cmd "$host: scp pubkey attempt $i" sudo -u "$CALLER_USER" scp -o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no "$TMP_PUB" "${CLIENT_USER}@${host}:${dest_path}" && return 0
     sleep 2
   done
   warn "$host: SCP failed after $SCP_RETRIES attempts"
@@ -181,6 +170,12 @@ auto_install_deps
 mkdir -p "$RUSTDIR"
 [[ -f "$PRIV" ]] || run_cmd "Generate RustDesk keypair" ssh-keygen -t ed25519 -N "" -f "$PRIV"
 export_rustdesk_pub_with_retries
+
+# Securely prepare temp readable copy
+cp "$PUB" "$TMP_PUB"
+chmod 644 "$TMP_PUB"
+chown "$CALLER_USER":"$CALLER_USER" "$TMP_PUB"
+
 pass "Server key ready. Fingerprint: $(key_fingerprint "$PUB")"
 
 mapfile -t HOSTS < <(discover_hosts)
@@ -197,7 +192,7 @@ else
   for c in "${choices[@]}"; do (( c>=1 && c<=${#HOSTS[@]} )) && SELECTED+=("${HOSTS[$((c-1))]}"); done
 fi
 
-if (( ${#SELECTED[@]} == 0 )); then warn "No valid selections. Exiting."; exit 0; fi
+if (( ${#SELECTED[@]} == 0 )); then warn "No valid selections. Exiting."; rm -f "$TMP_PUB"; exit 0; fi
 pass "Selected hosts: ${SELECTED[*]}"
 
 declare -A RESULT
@@ -208,6 +203,8 @@ for host in "${SELECTED[@]}"; do
     RESULT["$host"]="unreachable"
   fi
 done
+
+rm -f "$TMP_PUB"
 
 log "===== RustDesk Flatpak Key Sync COMPLETE ====="
 echo -e "\n=== Summary ==="
