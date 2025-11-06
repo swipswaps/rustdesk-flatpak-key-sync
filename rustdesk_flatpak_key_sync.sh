@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_flatpak_key_sync.sh (v2025-11-05.11)
+# rustdesk_flatpak_key_sync.sh (v2025-11-05.20)
 # ------------------------------------------------------------------------------
-# Fix: Adds permission-safe temp copy for pubkey so non-root scp succeeds.
-#      Keeps all existing features: retries, discovery, logging, filtering.
+# Upgrade: Adds interactive password prompting + auto-cache in ~/.rustdesk_sync_env
+# Ensures SSH+SCP always work, even for new clients without pre-shared keys.
+# Keeps all existing: retries, discovery, safe perms, full logging.
 # ==============================================================================
 set -euo pipefail
 shopt -s extglob
@@ -21,7 +22,6 @@ LOG_FILE="/var/log/rustdesk_flatpak_key_sync.log"
 SSH_TIMEOUT=10
 VERIFY_RETRIES=2
 EXPORT_RETRIES=3
-EXPORT_TMP_SUFFIX=".tmp"
 SCP_RETRIES=3
 AVAHI_FALLBACK=1
 ENV_FILE="${CALLER_HOME}/.rustdesk_sync_env"
@@ -74,7 +74,7 @@ auto_install_deps() {
 key_fingerprint() { sha256sum "$1" | awk '{print $1}'; }
 
 export_rustdesk_pub_with_retries() {
-  local tries=0 tmpfile="${PUB}${EXPORT_TMP_SUFFIX}"
+  local tries=0 tmpfile="${PUB}.tmp"
   while (( ++tries <= EXPORT_RETRIES )); do
     [[ -f "$PRIV" ]] || fatal "Private key missing: $PRIV"
     run_cmd "Export RustDesk public key (attempt $tries)" ssh-keygen -y -f "$PRIV" > "$tmpfile"
@@ -92,36 +92,51 @@ export_rustdesk_pub_with_retries() {
 discover_hosts() {
   local local_ip
   local_ip="$(hostname -I | awk '{print $1}')"
-  info "[DISCOVERY] Scanning LAN subnet $LAN_SUBNET..." >&2
-
+  info "[DISCOVERY] Scanning LAN subnet $LAN_SUBNET..."
   local nmap_out avahi_out
   nmap_out="$(mktemp)"
   avahi_out="$(mktemp)"
-
   run_cmd "Nmap discovery" nmap -p22 --open -oG - "$LAN_SUBNET" | tee "$nmap_out" >/dev/null
-
   mapfile -t nmap_hosts < <(awk '/22\/open/{print $2}' "$nmap_out" | sort -u)
   local mdns_hosts=()
   if (( AVAHI_FALLBACK )); then
     run_cmd "Avahi mDNS discovery" avahi-browse -art | tee "$avahi_out" >/dev/null
     mapfile -t mdns_hosts < <(awk -F';' '/IPv4/ {print $8}' "$avahi_out" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
   fi
-
   local combined=($(printf "%s\n" "${nmap_hosts[@]}" "${mdns_hosts[@]}" | sort -u))
   local filtered=()
   for h in "${combined[@]}"; do [[ "$h" != "$local_ip" ]] && filtered+=("$h"); done
-
   rm -f "$nmap_out" "$avahi_out"
   printf '%s\n' "${filtered[@]}"
 }
 
-bootstrap_ssh_key() {
+# ---------------------------------------------------------------------------
+# New helper: prompt user for missing password and save to ~/.rustdesk_sync_env
+# ---------------------------------------------------------------------------
+get_or_prompt_password() {
   local host="$1"
   local pass_var="SSH_PASS_${host//./_}"
   local password=""
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
   password="${!pass_var:-}"
-  [[ -z "$password" ]] && { warn "$host: No password in $ENV_FILE"; return 1; }
+
+  if [[ -z "$password" ]]; then
+    read -rsp "Enter SSH password for ${CLIENT_USER}@${host}: " password
+    echo
+    [[ -z "$password" ]] && { warn "Empty password for $host"; return 1; }
+    mkdir -p "$(dirname "$ENV_FILE")"
+    touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    echo "${pass_var}=\"${password}\"" >> "$ENV_FILE"
+    pass "Password cached for $host in $ENV_FILE"
+  fi
+  echo "$password"
+}
+
+bootstrap_ssh_key() {
+  local host="$1"
+  local password
+  password="$(get_or_prompt_password "$host")" || return 1
 
   run_cmd "$host: mkdir ~/.ssh" sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$CLIENT_USER@$host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
   run_cmd "$host: upload pubkey" sshpass -p "$password" scp -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" "$TMP_PUB" "$CLIENT_USER@$host:~/.ssh/tmpkey.pub"
@@ -136,11 +151,8 @@ ensure_ssh_access() {
     return 0
   fi
   warn "$host: key login failed, attempting bootstrap..."
-  if bootstrap_ssh_key "$host"; then
-    run_cmd "$host: SSH re-test" sudo -u "$CALLER_USER" ssh "${ssh_opts[@]}" -o BatchMode=yes "$CLIENT_USER@$host" 'echo ok'
-  else
-    return 1
-  fi
+  bootstrap_ssh_key "$host" || return 1
+  run_cmd "$host: SSH re-test" sudo -u "$CALLER_USER" ssh "${ssh_opts[@]}" -o BatchMode=yes "$CLIENT_USER@$host" 'echo ok'
 }
 
 sync_to_host() {
@@ -155,7 +167,6 @@ sync_to_host() {
     run_cmd "$host: mkdir ~/.config/rustdesk" "${ssh_exec[@]}" "$CLIENT_USER@$host" "mkdir -p ~/.config/rustdesk"
     dest_path="~/.config/rustdesk/server.pub"
   fi
-
   for ((i=1; i<=SCP_RETRIES; i++)); do
     run_cmd "$host: scp pubkey attempt $i" sudo -u "$CALLER_USER" scp -o ConnectTimeout="$SSH_TIMEOUT" -o StrictHostKeyChecking=no "$TMP_PUB" "${CLIENT_USER}@${host}:${dest_path}" && return 0
     sleep 2
@@ -170,12 +181,9 @@ auto_install_deps
 mkdir -p "$RUSTDIR"
 [[ -f "$PRIV" ]] || run_cmd "Generate RustDesk keypair" ssh-keygen -t ed25519 -N "" -f "$PRIV"
 export_rustdesk_pub_with_retries
-
-# Securely prepare temp readable copy
 cp "$PUB" "$TMP_PUB"
 chmod 644 "$TMP_PUB"
 chown "$CALLER_USER":"$CALLER_USER" "$TMP_PUB"
-
 pass "Server key ready. Fingerprint: $(key_fingerprint "$PUB")"
 
 mapfile -t HOSTS < <(discover_hosts)
@@ -205,7 +213,6 @@ for host in "${SELECTED[@]}"; do
 done
 
 rm -f "$TMP_PUB"
-
 log "===== RustDesk Flatpak Key Sync COMPLETE ====="
 echo -e "\n=== Summary ==="
 for h in "${!RESULT[@]}"; do
