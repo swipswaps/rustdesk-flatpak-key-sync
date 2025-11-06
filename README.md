@@ -8,15 +8,18 @@ This repository provides two Bash scripts to simplify the process of configuring
 
 The primary goal is to make setting up and maintaining a self-hosted RustDesk environment as "hands-off" as possible.
 
+### Key Problem Solved
+
+If you've ever seen the "Connecting..." spinner time out in your RustDesk client when trying to connect to your self-hosted server, it's almost always because the client does not have the server's correct public key. These scripts fix that by automating the key distribution and, crucially, **restarting the client-side RustDesk service** to ensure the new key is loaded.
+
 ## Scripts in this Repository
 
 1.  **`rustdesk_flatpak_key_sync.sh` (Recommended)**
-    *   This is the more advanced script. It supports both standard and Flatpak installations of RustDesk on client machines.
-    *   It includes robust features like dependency auto-installation, SSH key bootstrapping, and network discovery using both `nmap` and `avahi-browse` (mDNS).
+    *   The more advanced script that supports both **standard and Flatpak** installations of RustDesk on client machines.
+    *   Includes robust features like dependency auto-installation, SSH key bootstrapping, and network discovery.
 
 2.  **`rustdesk_key_sync.sh`**
-    *   A simpler, more lightweight version that targets the standard `RustDesk2.toml` configuration file.
-    *   This is suitable for environments where you are not using the Flatpak version of RustDesk.
+    *   A version that targets the standard `RustDesk2.toml` configuration file for non-Flatpak setups.
 
 ## Key Features
 
@@ -25,8 +28,9 @@ The primary goal is to make setting up and maintaining a self-hosted RustDesk en
 *   **Auto-Dependency Installation:** Checks for required tools (`nmap`, `sshpass`, etc.) and installs them on Debian, Fedora, or Arch-based systems.
 *   **SSH Bootstrap:** If key-based SSH access isn't set up, it can use a password to configure it for future passwordless access.
 *   **`sudo` Context-Awareness:** Correctly handles SSH authentication even when the script is run with `sudo`.
-*   **Standard & Flatpak Support:** The main script (`rustdesk_flatpak_key_sync.sh`) automatically detects the correct configuration path on each client.
-*   **Detailed Logging:** Provides clear output and logs all operations to `/var/log/rustdesk_flatpak_key_sync.log`.
+*   **Key Fingerprint Verification:** After syncing, the script double-checks the key on the client against the server's key to ensure the transfer was successful.
+*   **Automatic Service Restart:** **(The Fix!)** After a successful sync, the script automatically restarts the RustDesk service on the client, forcing it to load the new key.
+*   **Detailed Logging:** Provides clear, color-coded output and logs all operations to `/var/log/rustdesk_flatpak_key_sync.log`.
 
 ## Usage
 
@@ -59,4 +63,4 @@ You can edit the script to change the default configuration variables at the top
 *   `LAN_SUBNET`: The network range to scan (default: `"192.168.1.0/24"`).
 
 ---
-*This README has been updated by Gemini to reflect the current working version of the scripts.*
+*This README has been updated by Gemini to reflect the latest script upgrades, including key verification and automatic service restarts.*
