@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rustdesk_key_sync.sh (v3 - Feature Complete)
+# rustdesk_key_sync.sh (v4 - Nmap Hotfix)
 # ------------------------------------------------------------------------------
 # Merges the robust SSH bootstrapping and discovery from the stable-v2 script
 # with the multi-target (TOML, Flatpak, .pub) sync logic of the unified script.
@@ -68,12 +68,15 @@ auto_install_deps() {
 
 # --- HOST DISCOVERY & SELECTION ---
 discover_hosts() {
-    info "[DISCOVERY] Scanning LAN subnet(s) $LAN_SUBNET..."
+    info "[DISCOVERY] Scanning LAN subnet(s) $LAN_SUBNET for hosts with port 22 open..."
     local local_ips nmap_out
     local_ips=$(hostname -I)
     nmap_out=$(mktemp)
-    sudo nmap -p22 --open -sn "$LAN_SUBNET" -oG "$nmap_out"
-    mapfile -t nmap_hosts < <(awk '/Up$/{print $2}' "$nmap_out" | grep -vF "$local_ips" | sort -u)
+    # Correct Nmap command: -p22 filters for port 22, --open shows only open ports.
+    # The contradictory -sn (no port scan) flag has been removed.
+    sudo nmap -p22 --open "$LAN_SUBNET" -oG "$nmap_out"
+    # Correct awk command to parse the output of a port scan, not a ping scan.
+    mapfile -t nmap_hosts < <(awk '/\/open\// {print $2}' "$nmap_out" | grep -vF "$local_ips" | sort -u)
     
     if (( AVAHI_FALLBACK )); then
         info "[DISCOVERY] Using Avahi (mDNS) to supplement discovery..."
@@ -219,7 +222,7 @@ sync_to_host() {
             if sudo -E -u "$CALLER_USER" scp -o ConnectTimeout="$SSH_TIMEOUT" "$TMP_PUB" "${CLIENT_USER}@${host}:${dest_path}" >/dev/null 2>&1; then
                 pass "$host: Key file synced."
                 restart_rustdesk_client "$host" && FINAL_RESULTS["$host"]="Synced and Restarted" || FINAL_RESULTS["$host"]="Synced, Restart Failed"
-            else FINAL_RESULTS["$host"]="Sync Failed (SCP)" ; fi ;;
+            else FINAL_RESULTS["$host"]="Sync Failed (SCP)" ; fi ;; 
         toml)
             local remote_cfg="~/.config/rustdesk/RustDesk2.toml" temp_cfg="/tmp/RustDesk2.toml.$$.$host"
             if sudo -E -u "$CALLER_USER" scp -o ConnectTimeout="$SSH_TIMEOUT" "${CLIENT_USER}@${host}:${remote_cfg}" "$temp_cfg" >/dev/null 2>&1; then
@@ -231,14 +234,14 @@ sync_to_host() {
                     restart_rustdesk_client "$host" && FINAL_RESULTS["$host"]="Synced and Restarted" || FINAL_RESULTS["$host"]="Synced, Restart Failed"
                 else FINAL_RESULTS["$host"]="Sync Failed (TOML Upload)"; fi
                 rm "$temp_cfg"
-            else FINAL_RESULTS["$host"]="Sync Failed (TOML Download)"; fi ;;
+            else FINAL_RESULTS["$host"]="Sync Failed (TOML Download)"; fi ;; 
     esac
 }
 
 # --- MAIN ---
 trap 'rm -f "$TMP_PUB" /tmp/RustDesk2.toml*' EXIT
 
-log "===== RustDesk Key Sync (v3 - Feature Complete) START ======"
+log "===== RustDesk Key Sync (v4 - Nmap Hotfix) START ======"
 [[ "$EUID" -ne 0 ]] && fatal "This script must be run with sudo."
 
 auto_install_deps
